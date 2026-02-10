@@ -403,20 +403,83 @@ class ContextCompiler:
     async def _detect_target(self, dataset_id: str, extra: Optional[Dict] = None) -> Dict:
         """Detect or use the specified target variable."""
         result = {"name": None, "detected": False, "type": None, "class_distribution": None, "imbalance_ratio": None, "minority_class_pct": None}
+
+        # Priority 1: User-specified target
         if extra and extra.get("target_column"):
             result["name"] = extra["target_column"]
             result["detected"] = True
+
         try:
             from app.models.models import EdaResult
             eda = self.db.query(EdaResult).filter(EdaResult.dataset_id == dataset_id).first()
-            if eda and eda.statistics and result["name"]:
-                stats = _safe_json(eda.statistics)
+            if not eda:
+                return result
+
+            summary = _safe_json(eda.summary) if eda.summary else {}
+            stats = _safe_json(eda.statistics) if eda.statistics else {}
+            columns = summary.get("columns", [])
+
+            # Priority 2: Auto-detect from column name patterns
+            if not result["name"]:
+                target_patterns = [
+                    "target", "label", "class", "churn", "fraud", "outcome",
+                    "default", "survived", "y", "attrition", "response",
+                    "result", "diagnosis", "is_", "has_",
+                ]
+                cat_stats = stats.get("categorical_statistics", {})
+                num_stats = stats.get("numeric_statistics", {})
+
+                best_candidate = None
+                best_score = 0
+
+                for col in columns:
+                    cl = col.lower().strip()
+                    score = 0
+
+                    # Name pattern matching
+                    if any(p in cl for p in target_patterns):
+                        score += 3
+
+                    # Binary categorical (exactly 2 unique values)
+                    cs = cat_stats.get(col, {})
+                    if isinstance(cs, dict) and _si(cs.get("unique", 0)) == 2:
+                        score += 2
+
+                    # Binary numeric (0/1)
+                    ns = num_stats.get(col, {})
+                    if isinstance(ns, dict):
+                        mn = _sf(ns.get("min", -1))
+                        mx = _sf(ns.get("max", -1))
+                        if mn == 0 and mx == 1:
+                            score += 2
+
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = col
+
+                if best_candidate and best_score >= 2:
+                    result["name"] = best_candidate
+                    result["detected"] = True
+                    logger.info(f"Auto-detected target column: '{best_candidate}' (score={best_score})")
+
+            # Enrich with type information
+            if result["name"] and eda.statistics:
                 cs = stats.get("categorical_statistics", {}).get(result["name"])
-                if cs:
+                if cs and isinstance(cs, dict):
                     u = _si(cs.get("unique", 0))
                     result["type"] = "binary" if u == 2 else "multiclass" if u <= 20 else "high_cardinality"
-        except Exception:
-            pass
+                ns = stats.get("numeric_statistics", {}).get(result["name"])
+                if ns and isinstance(ns, dict):
+                    mn = _sf(ns.get("min", -1))
+                    mx = _sf(ns.get("max", -1))
+                    if mn == 0 and mx == 1:
+                        result["type"] = "binary"
+                        mean_val = _sf(ns.get("mean", 0.5))
+                        result["minority_class_pct"] = round(min(mean_val, 1 - mean_val) * 100, 1)
+                        result["imbalance_ratio"] = round(min(mean_val, 1 - mean_val) / max(mean_val, 1 - mean_val), 3) if max(mean_val, 1 - mean_val) > 0 else 0
+
+        except Exception as e:
+            logger.warning(f"Target detection error [{dataset_id}]: {e}")
         return result
 
     async def _get_collection_info(self, dataset_id: str) -> Optional[Dict]:
@@ -757,7 +820,34 @@ class ContextCompiler:
         return {"view": "data_management", "uploaded_datasets": bool(ctx.get("dataset_id")), "active_tab": extra.get("active_tab", "overview")}
 
     async def _enrich_eda(self, ctx, extra):
-        return {"view": "exploratory_analysis", "selected_feature": extra.get("selected_feature"), "active_tab": extra.get("active_tab", "overview")}
+        # Forward auto-detected target so rules/patterns can use it
+        target = ctx.get("target_variable", {})
+        target_name = target.get("name") if isinstance(target, dict) else None
+        target_type = target.get("type") if isinstance(target, dict) else None
+
+        # Also auto-detect from feature_stats if not already found
+        if not target_name:
+            fs = ctx.get("feature_stats", {})
+            candidates = fs.get("potential_target_columns", [])
+            if candidates:
+                # Pick best candidate (binary > name pattern > last column)
+                for c in candidates:
+                    if c.get("type") == "binary_categorical" or c.get("type") == "name_pattern":
+                        target_name = c.get("column")
+                        break
+                if not target_name:
+                    target_name = candidates[0].get("column")
+
+        return {
+            "view": "exploratory_analysis",
+            "target_column": extra.get("target_column") or target_name,
+            "target_type": target_type,
+            "target_detected": bool(target_name),
+            "selected_feature": extra.get("selected_feature"),
+            "active_tab": extra.get("active_tab", "overview"),
+            "problem_type": extra.get("problem_type",
+                                      "classification" if target_type in ("binary", "multiclass") else None),
+        }
 
     async def _enrich_training(self, ctx, extra):
         return {

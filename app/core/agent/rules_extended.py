@@ -50,6 +50,46 @@ class ExtendedRulesMixin:
         if not rows:
             return
 
+        # DQ-010: Numeric columns stored as strings (e.g., TotalCharges in Telco)
+        # High-cardinality categoricals with numeric-sounding names are likely
+        # numeric data stored as object dtype due to parsing issues (empty strings, etc.)
+        cat_stats = features.get("categorical_stats", {})
+        numeric_keywords = ["amount", "total", "charge", "price", "cost", "revenue",
+                            "income", "salary", "fee", "score", "rating", "count",
+                            "balance", "spend", "value", "rate", "percentage", "pct"]
+        mistyped_cols = []
+        for col, cs in cat_stats.items():
+            if not isinstance(cs, dict):
+                continue
+            unique_ratio = cs.get("unique_ratio", 0)
+            unique_count = cs.get("unique", 0)
+            # High cardinality + numeric-sounding name = likely numeric stored as string
+            if unique_ratio > 0.3 and unique_count > 20:
+                if any(k in col.lower() for k in numeric_keywords):
+                    mistyped_cols.append(col)
+
+        if mistyped_cols:
+            names = ", ".join(mistyped_cols[:4])
+            out.append(Insight(
+                severity="warning", category="Data Quality",
+                title=f"Likely Numeric Column(s) Stored as Text: {names}",
+                message=(
+                    f"Column(s) {names} have high cardinality and numeric-sounding names "
+                    f"but are typed as categorical/object. This often happens when a column "
+                    f"has blank strings, special characters, or formatting issues that prevent "
+                    f"pandas from auto-detecting the numeric dtype. The column is being treated "
+                    f"as text, which means it cannot be used in calculations or modeling."
+                ),
+                action=(
+                    f"Convert to numeric: df['{mistyped_cols[0]}'] = pd.to_numeric("
+                    f"df['{mistyped_cols[0]}'], errors='coerce'). The errors='coerce' flag "
+                    f"converts unparseable values to NaN. Then check for and impute the "
+                    f"resulting missing values."
+                ),
+                evidence=f"High-cardinality categoricals with numeric names: {names}",
+                impact="high", tags=["dtype", "type_coercion", "data_cleaning"], rule_id="DQ-010",
+            ))
+
         # DQ-011: Outlier detection via IQR proxy
         numeric_stats = features.get("numeric_stats", {})
         outlier_cols = []
@@ -328,10 +368,25 @@ class ExtendedRulesMixin:
             ))
 
         # FE-008: Log transform for monetary/count features
+        # IMPORTANT: Only flag numeric columns — "PaymentMethod" contains "payment"
+        # but is categorical, not monetary
         col_names = profile.get("column_names", [])
+        numeric_set = set(profile.get("numeric_columns", []))
         monetary_keywords = ["price", "cost", "revenue", "income", "salary", "amount",
-                           "charge", "fee", "payment", "spend", "total", "balance"]
-        monetary_cols = [c for c in col_names if any(k in c.lower() for k in monetary_keywords)]
+                             "charge", "fee", "spend", "total", "balance"]
+        # Exclude keywords that commonly appear in categorical column names
+        cat_keywords = ["method", "type", "category", "status", "mode", "plan", "class"]
+        monetary_cols = [
+            c for c in col_names
+            if any(k in c.lower() for k in monetary_keywords)
+               and (
+                       c in numeric_set  # Must be numeric dtype
+                       or not any(ck in c.lower() for ck in cat_keywords)  # OR not obviously categorical
+               )
+        ]
+        # Final filter: if we have numeric column info, strictly enforce it
+        if numeric_set:
+            monetary_cols = [c for c in monetary_cols if c in numeric_set]
         if monetary_cols:
             out.append(Insight(
                 severity="tip", category="Feature Engineering",
@@ -484,10 +539,10 @@ class ExtendedRulesMixin:
 
         # DL-004: Suspicious column names suggesting post-hoc data
         leakage_keywords = ["result", "outcome", "status_final", "days_to",
-                          "time_to", "post_", "after_", "final_",
-                          "total_", "cumulative_", "lifetime_"]
+                            "time_to", "post_", "after_", "final_",
+                            "total_", "cumulative_", "lifetime_"]
         suspicious = [c for c in col_names
-                     if any(k in c.lower() for k in leakage_keywords)]
+                      if any(k in c.lower() for k in leakage_keywords)]
         if suspicious:
             out.append(Insight(
                 severity="warning", category="Data Leakage",
@@ -692,9 +747,9 @@ class ExtendedRulesMixin:
 
         # AS-009: Baseline model reminder
         all_algos = (screen_ctx.get("selected_algorithms") or
-                    frontend.get("selected_algorithms", []))
+                     frontend.get("selected_algorithms", []))
         if all_algos and not any("logistic" in a.lower() or "linear" in a.lower()
-                                for a in all_algos):
+                                 for a in all_algos):
             out.append(Insight(
                 severity="tip", category="Algorithm Selection",
                 title="Include a Simple Baseline in Your Comparison",

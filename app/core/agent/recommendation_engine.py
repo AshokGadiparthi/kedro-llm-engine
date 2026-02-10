@@ -499,11 +499,27 @@ class RecommendationEngine:
 
         # ── TIER 1: Always include baseline ──
         if problem_type == "classification":
+            # Data-aware description: warn if categorical-heavy
+            if categorical > 0 and numeric > 0 and categorical > numeric * 2:
+                logreg_reason = (
+                    f"Linear baseline. ⚠️ NOTE: Your dataset has {categorical} categorical vs "
+                    f"{numeric} numeric features — LogReg requires ALL categoricals to be encoded "
+                    f"first (target encoding recommended for high-cardinality). Consider CatBoost "
+                    f"as your primary model since it handles categoricals natively."
+                )
+            elif categorical > 10:
+                logreg_reason = (
+                    f"Linear baseline. With {categorical} categorical features, use ordinal or "
+                    f"target encoding — one-hot would create too many sparse columns."
+                )
+            else:
+                logreg_reason = "Every comparison needs a strong linear baseline. Fast, interpretable, production-friendly."
+
             recommendations.append({
                 "algorithm": "LogisticRegression",
                 "tier": "baseline",
                 "priority": 1,
-                "reason": "Every comparison needs a strong linear baseline. Fast, interpretable, production-friendly.",
+                "reason": logreg_reason,
                 "config": {
                     "C": 1.0,
                     "penalty": "l2",
@@ -515,11 +531,20 @@ class RecommendationEngine:
                 "inference_latency": "<1ms",
             })
         else:
+            if categorical > numeric * 2:
+                ridge_reason = (
+                    f"Regularized linear baseline. ⚠️ With {categorical} categorical features, "
+                    f"encode them first (target encoding recommended). Consider gradient boosting "
+                    f"as primary model for categorical-heavy data."
+                )
+            else:
+                ridge_reason = "Regularized linear regression baseline. Stable, interpretable."
+
             recommendations.append({
                 "algorithm": "Ridge",
                 "tier": "baseline",
                 "priority": 1,
-                "reason": "Regularized linear regression baseline. Stable, interpretable.",
+                "reason": ridge_reason,
                 "config": {"alpha": 1.0},
                 "expected_training_time": "seconds",
                 "inference_latency": "<1ms",
@@ -557,12 +582,22 @@ class RecommendationEngine:
             ])
 
         elif rows < 5000:
+            rf_reason = (
+                    f"Solid performance with minimal tuning for {rows:,} rows."
+                    + (f" Handles mixed types but needs ordinal encoding for {categorical} categoricals." if categorical > 5 else "")
+                    + f" max_features='sqrt' → ~{max(1, int(cols**0.5))} features per split."
+            )
+            xgb_reason = (
+                    f"State-of-the-art on tabular data."
+                    + (f" Needs encoding for {categorical} categoricals — use ordinal." if categorical > 5 else "")
+                    + f" Regularization important at {rows:,} rows to prevent overfitting."
+            )
             recommendations.extend([
                 {
                     "algorithm": "RandomForest",
                     "tier": "medium_data",
                     "priority": 2,
-                    "reason": "Solid performance with minimal tuning. Good feature importance.",
+                    "reason": rf_reason,
                     "config": {
                         "n_estimators": 200,
                         "max_depth": None,
@@ -575,7 +610,7 @@ class RecommendationEngine:
                     "algorithm": "XGBoost",
                     "tier": "medium_data",
                     "priority": 2,
-                    "reason": "State-of-the-art on tabular data. Needs regularization on this data size.",
+                    "reason": xgb_reason,
                     "config": {
                         "n_estimators": 200,
                         "max_depth": 6,
@@ -591,12 +626,21 @@ class RecommendationEngine:
             ])
 
         else:  # rows >= 5000
+            lgbm_reason = (
+                    f"Fastest boosting for {rows:,} rows."
+                    + (f" Native categorical support — no encoding needed for {categorical} categorical features." if categorical > 3 else " Native categorical support.")
+                    + " Leaf-wise growth is faster than level-wise."
+            )
+            xgb_large_reason = (
+                    f"Strong accuracy on {rows:,} rows, excellent SHAP support for interpretability."
+                    + (f" Needs ordinal encoding for {categorical} categoricals." if categorical > 5 else "")
+            )
             recommendations.extend([
                 {
                     "algorithm": "LightGBM",
                     "tier": "large_data",
                     "priority": 2,
-                    "reason": f"Fastest boosting for large data ({rows:,} rows). Native categorical support.",
+                    "reason": lgbm_reason,
                     "config": {
                         "n_estimators": 500,
                         "num_leaves": 31,
@@ -613,7 +657,7 @@ class RecommendationEngine:
                     "algorithm": "XGBoost",
                     "tier": "large_data",
                     "priority": 2,
-                    "reason": "Strong accuracy, well-established, excellent SHAP support.",
+                    "reason": xgb_large_reason,
                     "config": {
                         "n_estimators": 500,
                         "max_depth": 8,
@@ -739,7 +783,7 @@ class RecommendationEngine:
                 "method": "GridSearchCV",
                 "parameters": {
                     "C": {"type": "float", "range": [0.001, 100], "log_scale": True,
-                           "grid": [0.001, 0.01, 0.1, 1.0, 10, 100]},
+                          "grid": [0.001, 0.01, 0.1, 1.0, 10, 100]},
                     "penalty": {"type": "categorical", "values": ["l1", "l2", "elasticnet"]},
                     "solver": {"type": "categorical", "values": ["lbfgs", "saga"]},
                     "l1_ratio": {"type": "float", "range": [0.0, 1.0],

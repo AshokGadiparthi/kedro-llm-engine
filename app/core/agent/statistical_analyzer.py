@@ -577,9 +577,9 @@ class StatisticalAnalyzer:
 
         # Overall assessment
         temporal_signals = (
-            len(datetime_cols) +
-            len(signals["temporal_name_patterns"]) +
-            len(signals["monotonic_candidates"])
+                len(datetime_cols) +
+                len(signals["temporal_name_patterns"]) +
+                len(signals["monotonic_candidates"])
         )
         signals["is_likely_timeseries"] = temporal_signals >= 2
 
@@ -669,12 +669,20 @@ class StatisticalAnalyzer:
         report.feature_score = max(0, min(100, feature_score))
 
         # ── Target Score (0-100) ──
-        target_score = 80  # Assume decent if not enough info
+        target_score = 60  # Unknown target = assume some risk, not "decent"
         screen_ctx = context.get("screen_context", {}) or {}
         frontend = context.get("frontend_state", {}) or {}
+
+        # Bridge: also check target_variable directly
+        target_info = context.get("target_variable", {})
         target = screen_ctx.get("target_column") or frontend.get("target_column")
+        if not target and isinstance(target_info, dict):
+            target = target_info.get("name")
+
         if target:
             numeric_stats = feature_stats.get("numeric_stats", {})
+            cat_stats = feature_stats.get("categorical_stats", {})
+
             if target in numeric_stats:
                 stats = numeric_stats[target]
                 if isinstance(stats, dict):
@@ -690,6 +698,32 @@ class StatisticalAnalyzer:
                         elif minority_pct >= 30:
                             target_score = 90
                             report.strengths.append("Well-balanced target distribution")
+                        else:
+                            target_score = 75
+
+            elif target in cat_stats:
+                # Categorical target — check unique count
+                cs = cat_stats[target]
+                if isinstance(cs, dict):
+                    unique = cs.get("unique", 0)
+                    if unique == 2:
+                        target_score = 80
+                        report.strengths.append(f"Binary target detected: '{target}'")
+                    elif unique <= 10:
+                        target_score = 70
+                        report.strengths.append(f"Multi-class target detected: '{target}' ({unique} classes)")
+                    elif unique <= 20:
+                        target_score = 55
+                        report.bottlenecks.append(f"Many target classes ({unique}) — may need grouping")
+                    else:
+                        target_score = 35
+                        report.bottlenecks.append(f"Target '{target}' has {unique} classes — unlikely classification target")
+            else:
+                target_score = 70  # Target found but no stats available
+                report.strengths.append(f"Target column identified: '{target}'")
+        else:
+            report.bottlenecks.append("Target column not specified — cannot assess class balance")
+
         report.target_score = target_score
 
         # ── Complexity Score (0-100, higher = harder) ──
@@ -877,6 +911,22 @@ class StatisticalAnalyzer:
         Run ALL statistical analyses and return a comprehensive report.
         This is the main entry point for the orchestrator.
         """
+        # Bridge target_variable → screen_context for all sub-analyses
+        target_info = context.get("target_variable", {})
+        if isinstance(target_info, dict) and target_info.get("name"):
+            sc = context.get("screen_context")
+            if sc is None:
+                sc = {}
+                context["screen_context"] = sc
+            if not sc.get("target_column"):
+                sc["target_column"] = target_info["name"]
+            fs = context.get("frontend_state")
+            if fs is None:
+                fs = {}
+                context["frontend_state"] = fs
+            if not fs.get("target_column"):
+                fs["target_column"] = target_info["name"]
+
         return {
             "distributions": [vars(d) for d in self.profile_distributions(context)],
             "cardinality": [vars(c) for c in self.analyze_cardinality(context)],

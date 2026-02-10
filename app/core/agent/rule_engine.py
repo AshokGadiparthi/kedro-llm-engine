@@ -109,6 +109,27 @@ class RuleEngine(_get_extended_mixin()):
         insights: List[Insight] = []
         screen = context.get("screen", "")
 
+        # ── Bridge target_variable → screen_context ──
+        # context_compiler stores auto-detected target in ctx["target_variable"]["name"]
+        # but rules/patterns read from ctx["screen_context"]["target_column"].
+        # This bridge ensures auto-detected targets are visible to all consumers.
+        target_info = context.get("target_variable", {})
+        if isinstance(target_info, dict) and target_info.get("name"):
+            sc = context.get("screen_context")
+            if sc is None:
+                sc = {}
+                context["screen_context"] = sc
+            if not sc.get("target_column"):
+                sc["target_column"] = target_info["name"]
+                logger.info(f"Target bridge: injected '{target_info['name']}' into screen_context")
+            # Also bridge into frontend_state as fallback
+            fs = context.get("frontend_state")
+            if fs is None:
+                fs = {}
+                context["frontend_state"] = fs
+            if not fs.get("target_column"):
+                fs["target_column"] = target_info["name"]
+
         # ── Universal rules (run on every screen) ──
         self._rules_data_quality(context, insights)
         self._rules_feature_health(context, insights)
@@ -125,7 +146,32 @@ class RuleEngine(_get_extended_mixin()):
         if hasattr(self, '_rules_target_variable_extended'):
             self._rules_target_variable_extended(context, insights)
 
+        # ── AI Insights dedicated screen: fire ALL rules ──
+        if screen in ("ai_insights",):
+            self._rules_feature_engineering(context, insights)
+            self._rules_training_config(context, insights)
+            self._rules_algorithm_selection(context, insights)
+            self._rules_evaluation_metrics(context, insights)
+            self._rules_model_comparison(context, insights)
+            self._rules_production_readiness(context, insights)
+            self._rules_deployment_safety(context, insights)
+            self._rules_monitoring_drift(context, insights)
+            self._rules_dashboard_overview(context, insights)
+            for _ext in [
+                '_rules_feature_engineering_extended',
+                '_rules_training_config_extended',
+                '_rules_algorithm_selection_extended',
+                '_rules_evaluation_metrics_extended',
+                '_rules_deployment_extended',
+                '_rules_monitoring_extended',
+            ]:
+                if hasattr(self, _ext):
+                    getattr(self, _ext)(context, insights)
+
         # ── Screen-specific rules ──
+        if screen in ("dashboard",):
+            self._rules_dashboard_overview(context, insights)
+
         if screen in ("eda",):
             self._rules_feature_engineering(context, insights)
             if hasattr(self, '_rules_feature_engineering_extended'):
@@ -436,43 +482,73 @@ class RuleEngine(_get_extended_mixin()):
         # FH-004: High cardinality categoricals
         high_card = features.get("high_cardinality_categoricals", [])
         if high_card:
-            for col_info in high_card[:3]:
+            # Group near-unique (>80%) into a single insight
+            near_unique = [c for c in high_card if c.get("unique_ratio", 0) > 0.8]
+            moderate_card = [c for c in high_card if c.get("unique_ratio", 0) <= 0.8 and c.get("unique_count", 0) > 50]
+
+            if len(near_unique) == 1:
+                col_info = near_unique[0]
                 col = col_info["column"]
                 unique = col_info.get("unique_count", 0)
                 ratio = col_info.get("unique_ratio", 0)
+                out.append(Insight(
+                    severity="warning", category="Feature Health",
+                    title=f"Near-Unique Categorical: {col}",
+                    message=(
+                        f"'{col}' has {unique} unique values across {rows} rows "
+                        f"({ratio*100:.0f}% unique). This is likely an identifier, not a "
+                        f"feature. One-hot encoding would create {unique} sparse columns."
+                    ),
+                    action=(
+                        f"If '{col}' is an ID/name field, exclude it from features. "
+                        f"If it's a legitimate high-cardinality feature (e.g., zip code), "
+                        f"use target encoding or hash encoding instead of one-hot."
+                    ),
+                    evidence=f"{col}: {unique} unique values ({ratio*100:.0f}% of rows)",
+                    impact="medium", tags=["cardinality", "encoding"], rule_id="FH-004",
+                ))
+            elif len(near_unique) > 1:
+                names = ", ".join(c["column"] for c in near_unique[:5])
+                details = "; ".join(
+                    f"{c['column']} ({c.get('unique_count', 0)} unique, {c.get('unique_ratio', 0)*100:.0f}%)"
+                    for c in near_unique[:5]
+                )
+                out.append(Insight(
+                    severity="warning", category="Feature Health",
+                    title=f"{len(near_unique)} Near-Unique Categorical Columns",
+                    message=(
+                        f"Columns {names} have very high cardinality (>80% unique values). "
+                        f"These are likely identifiers or numeric columns stored as text, "
+                        f"not useful categorical features. One-hot encoding would create "
+                        f"thousands of sparse columns."
+                    ),
+                    action=(
+                        f"Review each column: (1) ID columns like customerID → exclude from features. "
+                        f"(2) Numeric-looking columns like TotalCharges → convert with "
+                        f"pd.to_numeric(df[col], errors='coerce'). "
+                        f"(3) Legitimate high-cardinality → use target encoding."
+                    ),
+                    evidence=details,
+                    impact="high", tags=["cardinality", "encoding", "id_columns"], rule_id="FH-004",
+                ))
 
-                if ratio > 0.8:
-                    out.append(Insight(
-                        severity="warning", category="Feature Health",
-                        title=f"Near-Unique Categorical: {col}",
-                        message=(
-                            f"'{col}' has {unique} unique values across {rows} rows "
-                            f"({ratio*100:.0f}% unique). This is likely an identifier, not a "
-                            f"feature. One-hot encoding would create {unique} sparse columns."
-                        ),
-                        action=(
-                            f"If '{col}' is an ID/name field, exclude it from features. "
-                            f"If it's a legitimate high-cardinality feature (e.g., zip code), "
-                            f"use target encoding or hash encoding instead of one-hot."
-                        ),
-                        evidence=f"{col}: {unique} unique values ({ratio*100:.0f}% of rows)",
-                        impact="medium", tags=["cardinality", "encoding"], rule_id="FH-004",
-                    ))
-                elif unique > 50:
-                    out.append(Insight(
-                        severity="info", category="Feature Health",
-                        title=f"High-Cardinality Feature: {col} ({unique} values)",
-                        message=(
-                            f"One-hot encoding '{col}' would add {unique} binary columns. "
-                            f"This may increase dimensionality significantly."
-                        ),
-                        action=(
-                            "Consider target encoding, frequency encoding, or grouping rare "
-                            "categories into an 'Other' bucket (combine categories with <1% frequency)."
-                        ),
-                        evidence=f"{col}: {unique} unique categories",
-                        impact="low", tags=["cardinality"], rule_id="FH-005",
-                    ))
+            for col_info in moderate_card[:3]:
+                col = col_info["column"]
+                unique = col_info.get("unique_count", 0)
+                out.append(Insight(
+                    severity="info", category="Feature Health",
+                    title=f"High-Cardinality Feature: {col} ({unique} values)",
+                    message=(
+                        f"One-hot encoding '{col}' would add {unique} binary columns. "
+                        f"This may increase dimensionality significantly."
+                    ),
+                    action=(
+                        "Consider target encoding, frequency encoding, or grouping rare "
+                        "categories into an 'Other' bucket (combine categories with <1% frequency)."
+                    ),
+                    evidence=f"{col}: {unique} unique categories",
+                    impact="low", tags=["cardinality"], rule_id="FH-005",
+                ))
 
         # FH-006: Feature type balance
         num_count = profile.get("numeric_count", 0)
@@ -543,7 +619,7 @@ class RuleEngine(_get_extended_mixin()):
                 ),
                 action=(
                     "Use sklearn's PolynomialFeatures(degree=2, interaction_only=True) to "
-                    "generate pairwise interactions. For {len(numeric_cols)} features this "
+                    f"generate pairwise interactions. For {len(numeric_cols)} features this "
                     f"produces ~{len(numeric_cols) * (len(numeric_cols)-1) // 2} interaction terms."
                 ),
                 evidence=f"{len(numeric_cols)} numeric features",
@@ -674,7 +750,7 @@ class RuleEngine(_get_extended_mixin()):
             for col_info in id_cols[:5]:
                 col = col_info["column"]
                 reason = "name matches ID pattern" if col_info.get("detected_by") == "name_pattern" else \
-                         f"{col_info.get('unique_ratio', 0)*100:.0f}% unique values"
+                    f"{col_info.get('unique_ratio', 0)*100:.0f}% unique values"
                 out.append(Insight(
                     severity="warning", category="Data Leakage",
                     title=f"Potential ID Column: '{col}'",
@@ -1482,6 +1558,217 @@ class RuleEngine(_get_extended_mixin()):
 
     # ══════════════════════════════════════════════════════════════
     # 15. PIPELINE LIFECYCLE RULES (PL-001 → PL-008)
+    # ══════════════════════════════════════════════════════════════
+
+    # ══════════════════════════════════════════════════════════════
+    # DASHBOARD OVERVIEW RULES (DASH-001 to DASH-009)
+    # ══════════════════════════════════════════════════════════════
+
+    def _rules_dashboard_overview(self, ctx: Dict, out: List[Insight]):
+        """Dashboard-specific rules: project health, model status, action items."""
+        training = ctx.get("training_history", {}) or {}
+        registry = ctx.get("registry_info", {}) or {}
+        versions = ctx.get("model_versions", {}) or {}
+        pipeline = ctx.get("pipeline_state", {}) or {}
+        profile = ctx.get("dataset_profile", {}) or {}
+        quality = ctx.get("data_quality", {}) or {}
+        frontend = ctx.get("frontend_state", {}) or {}
+
+        total_models = registry.get("total_registered", 0) or _si(frontend.get("total_models", 0))
+        total_datasets = _si(frontend.get("total_datasets", 0))
+        completed_jobs = training.get("completed_jobs", 0)
+        all_versions = versions.get("versions", []) or []
+
+        # ── DASH-001 / DASH-002: Getting started ──
+        if total_models == 0 and total_datasets == 0:
+            out.append(Insight(
+                severity="info", category="Getting Started",
+                title="New Project — Let's Get Started!",
+                message=(
+                    "This project doesn't have any models or datasets yet. "
+                    "Start by uploading a dataset in Data Management, then run "
+                    "Exploratory Data Analysis to understand your data."
+                ),
+                action="Go to Data Management → Upload Dataset",
+                impact="high", tags=["getting_started", "onboarding"],
+                rule_id="DASH-001",
+            ))
+        elif total_models == 0 and total_datasets > 0:
+            out.append(Insight(
+                severity="tip", category="Next Step",
+                title=f"You Have {total_datasets} Dataset(s) — Ready to Train!",
+                message=(
+                    f"Your project has {total_datasets} dataset(s) uploaded. "
+                    "Run EDA to check data quality, then proceed to model training."
+                ),
+                action="Go to Exploratory Data Analysis → Analyze your dataset",
+                impact="medium", tags=["workflow", "next_step"],
+                rule_id="DASH-002",
+            ))
+
+        # ── DASH-003: All models 0% accuracy ──
+        avg_accuracy = frontend.get("avg_accuracy", None)
+        if avg_accuracy is not None and float(avg_accuracy) == 0.0 and total_models > 0:
+            out.append(Insight(
+                severity="warning", category="Model Health",
+                title=f"All {total_models} Models Show 0% Accuracy",
+                message=(
+                    "None of your trained models have recorded accuracy metrics. "
+                    "This usually means training completed but metrics weren't captured, "
+                    "or the models need to be evaluated."
+                ),
+                action="Go to Model Evaluation to assess model performance.",
+                evidence=f"Models: {total_models}, Avg accuracy: {avg_accuracy}%",
+                impact="high", tags=["model_health", "accuracy"],
+                rule_id="DASH-003",
+            ))
+
+        # ── DASH-004: No deployed models ──
+        deployed = _si(frontend.get("deployed_models", 0))
+        if total_models > 0 and deployed == 0:
+            out.append(Insight(
+                severity="tip", category="Deployment",
+                title="No Models Deployed Yet",
+                message=(
+                    f"You have {total_models} trained model(s) but none are deployed to production. "
+                    "Once you're satisfied with performance, deploy to start making predictions."
+                ),
+                action="Go to Model Registry → Select best model → Deploy",
+                impact="medium", tags=["deployment", "workflow"],
+                rule_id="DASH-004",
+            ))
+
+        # ── DASH-005: Deployed but no predictions ──
+        total_preds = _si(frontend.get("total_predictions", 0))
+        if deployed > 0 and total_preds == 0:
+            out.append(Insight(
+                severity="tip", category="Predictions",
+                title="Deployed Model Not Yet Used for Predictions",
+                message=(
+                    "You have deployed model(s) but no predictions have been made yet. "
+                    "Test with sample data to verify the model works correctly."
+                ),
+                action="Go to Predictions → Upload test data or use single prediction",
+                impact="low", tags=["predictions"],
+                rule_id="DASH-005",
+            ))
+
+        # ── DASH-006: Primary dataset quality ──
+        quality_score = _sf(quality.get("quality_score", 0))
+        completeness = _sf(quality.get("completeness", 0))
+        if quality_score > 0 and quality_score < 70:
+            out.append(Insight(
+                severity="warning", category="Data Quality",
+                title=f"Primary Dataset Quality: {quality_score:.0f}/100",
+                message=(
+                    f"Your primary dataset has a quality score of {quality_score:.0f}/100 "
+                    f"with {completeness:.1f}% completeness. Improving data quality before "
+                    "training will significantly boost model performance."
+                ),
+                action="Go to EDA → Review data quality issues → Fix before training",
+                evidence=f"Quality: {quality_score:.0f}, Completeness: {completeness:.1f}%",
+                impact="high", tags=["data_quality"],
+                rule_id="DASH-006",
+            ))
+        elif quality_score >= 90:
+            out.append(Insight(
+                severity="success", category="Data Quality",
+                title=f"Excellent Data Quality ({quality_score:.0f}/100)",
+                message=f"Your primary dataset is clean and well-structured. Completeness: {completeness:.1f}%.",
+                evidence=f"Quality: {quality_score:.0f}/100",
+                impact="low", tags=["data_quality"],
+                rule_id="DASH-006",
+            ))
+
+        # ── DASH-007: Best model summary ──
+        if len(all_versions) >= 2:
+            best = versions.get("best_version")
+            if best:
+                best_algo = best.get("algorithm", "Unknown")
+                best_f1 = _sf(best.get("metrics", {}).get("f1_score", 0))
+                if best_f1 > 0:
+                    out.append(Insight(
+                        severity="success" if best_f1 > 0.7 else "info",
+                        category="Model Performance",
+                        title=f"Best Model: {best_algo} (F1: {best_f1:.3f})",
+                        message=(
+                            f"Across {len(all_versions)} model versions, {best_algo} "
+                            f"achieves the highest F1 score of {best_f1:.3f}."
+                        ),
+                        evidence=f"Compared {len(all_versions)} versions",
+                        impact="medium", tags=["model_comparison"],
+                        rule_id="DASH-007",
+                    ))
+
+        # ── DASH-008: Failed jobs alert ──
+        failed_jobs = _si(training.get("failed_jobs", 0))
+        total_jobs = _si(training.get("total_jobs", 0))
+        if failed_jobs > 0:
+            fail_rate = (failed_jobs / total_jobs * 100) if total_jobs > 0 else 0
+            out.append(Insight(
+                severity="warning" if failed_jobs < 3 else "critical",
+                category="Pipeline Health",
+                title=f"{failed_jobs} Failed Job(s) Need Attention",
+                message=(
+                    f"{failed_jobs} out of {total_jobs} jobs have failed "
+                    f"({fail_rate:.0f}% failure rate). Check error logs for details."
+                ),
+                action="Go to ML Flow → Check failed job logs",
+                evidence=f"Failed: {failed_jobs}/{total_jobs}",
+                impact="high", tags=["pipeline", "errors"],
+                rule_id="DASH-008",
+            ))
+
+        # ── DASH-009: Project readiness checklist ──
+        has_data = total_datasets > 0
+        has_eda = quality_score > 0
+        has_models = total_models > 0
+        has_good_model = any(
+            _sf(v.get("metrics", {}).get("f1_score", 0)) > 0.5
+            for v in all_versions
+        ) if all_versions else False
+        has_deployment = deployed > 0
+
+        steps_done = sum([has_data, has_eda, has_models, has_good_model, has_deployment])
+        steps_total = 5
+        progress_pct = int(steps_done / steps_total * 100)
+
+        checklist = []
+        if has_data:
+            checklist.append("✅ Data uploaded")
+        else:
+            checklist.append("⬜ Upload dataset")
+        if has_eda:
+            checklist.append("✅ EDA completed")
+        else:
+            checklist.append("⬜ Run EDA analysis")
+        if has_models:
+            checklist.append("✅ Model trained")
+        else:
+            checklist.append("⬜ Train a model")
+        if has_good_model:
+            checklist.append("✅ Good performance (F1 > 0.5)")
+        else:
+            checklist.append("⬜ Improve model performance")
+        if has_deployment:
+            checklist.append("✅ Model deployed")
+        else:
+            checklist.append("⬜ Deploy to production")
+
+        out.append(Insight(
+            severity="success" if progress_pct >= 80 else "info",
+            category="Project Progress",
+            title=f"Project Readiness: {progress_pct}% ({steps_done}/{steps_total})",
+            message=" | ".join(checklist),
+            evidence=f"Progress: {steps_done}/{steps_total} milestones completed",
+            metric_key="project_readiness",
+            metric_value=float(progress_pct),
+            impact="medium", tags=["progress", "checklist"],
+            rule_id="DASH-009",
+        ))
+
+    # ══════════════════════════════════════════════════════════════
+    # PIPELINE LIFECYCLE RULES (PL-001 to PL-005)
     # ══════════════════════════════════════════════════════════════
 
     def _rules_pipeline_lifecycle(self, ctx: Dict, out: List[Insight]):

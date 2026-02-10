@@ -19,14 +19,54 @@ Integration (in main.py):
 
 import logging
 import time
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 
 from app.core.database import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ═══════════════════════════════════════════════════════════════
+# RATE LIMITER (in-memory, per-user, protects /ask LLM cost)
+# ═══════════════════════════════════════════════════════════════
+
+class _AskRateLimiter:
+    """Simple per-user rate limiter for /ask endpoint (LLM calls cost ~$0.02 each)."""
+
+    def __init__(self, max_calls: int = 20, window_seconds: int = 3600):
+        self._calls: Dict[str, List[float]] = defaultdict(list)
+        self._max = max_calls
+        self._window = window_seconds
+
+    def check(self, user_id: str) -> bool:
+        """Return True if allowed, False if rate-limited."""
+        now = time.time()
+        cutoff = now - self._window
+        # Prune old entries
+        self._calls[user_id] = [t for t in self._calls[user_id] if t > cutoff]
+        if len(self._calls[user_id]) >= self._max:
+            return False
+        self._calls[user_id].append(now)
+        return True
+
+    def remaining(self, user_id: str) -> int:
+        now = time.time()
+        cutoff = now - self._window
+        recent = [t for t in self._calls[user_id] if t > cutoff]
+        return max(0, self._max - len(recent))
+
+    def reset_seconds(self, user_id: str) -> int:
+        if not self._calls[user_id]:
+            return 0
+        oldest = min(t for t in self._calls[user_id] if t > time.time() - self._window)
+        return max(0, int(oldest + self._window - time.time()))
+
+
+_ask_limiter = _AskRateLimiter(max_calls=20, window_seconds=3600)  # 20 calls/hour
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -61,7 +101,7 @@ def _get_orchestrator(db):
 # ═══════════════════════════════════════════════════════════════
 
 class InsightRequest(BaseModel):
-    screen: str = Field(..., description="Current screen: dashboard|data|eda|mlflow|training|evaluation|registry|deployment|predictions|monitoring")
+    screen: str = Field(..., description="Current screen: dashboard|data|eda|mlflow|training|evaluation|registry|deployment|predictions|monitoring|ai_insights")
     project_id: Optional[str] = None
     dataset_id: Optional[str] = None
     model_id: Optional[str] = None
@@ -136,6 +176,7 @@ class InsightResponse(BaseModel):
     counts: Dict[str, int] = {}
     timing: Dict[str, float] = {}
     memory_applied: List[Dict[str, Any]] = []
+    suggested_questions: List[str] = []
 
 
 class AskResponse(BaseModel):
@@ -211,7 +252,26 @@ async def ask_expert(request: AskRequest, db=Depends(get_db)):
     Pipeline: Context → Statistical Analysis → Rule Engine →
     Q&A Engine (deterministic, 18+ intent categories) →
     LLM Enhancement (if confidence < 0.7) → Memory → Response
+
+    Rate-limited: 20 calls/hour per user (each LLM call costs ~$0.02).
     """
+    # ── Rate limiting (protect against cost overrun) ──
+    uid = request.user_id or "anonymous"
+    use_llm = request.use_llm or "auto"
+    if use_llm in ("always", "auto"):
+        if not _ask_limiter.check(uid):
+            remaining_secs = _ask_limiter.reset_seconds(uid)
+            logger.warning(f"Rate limit hit for user '{uid}' on /ask")
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "rate_limited",
+                    "message": f"AI analysis rate limit reached (20/hour). Try again in {remaining_secs // 60} minutes.",
+                    "remaining_calls": 0,
+                    "reset_seconds": remaining_secs,
+                },
+            )
+
     try:
         orchestrator = _get_orchestrator(db)
         bundle = await orchestrator.ask(
@@ -223,10 +283,14 @@ async def ask_expert(request: AskRequest, db=Depends(get_db)):
             user_id=request.user_id,
             extra=request.extra,
             conversation_history=request.conversation_history,
-            use_llm=request.use_llm or "auto",
+            use_llm=use_llm,
         )
-        return AskResponse(**bundle.to_dict())
+        response = AskResponse(**bundle.to_dict())
+        # Add rate limit headers info to timing
+        return response
 
+    except HTTPException:
+        raise  # Re-raise rate limit errors
     except Exception as e:
         logger.error(f"Agent ask error: {e}", exc_info=True)
         return AskResponse(

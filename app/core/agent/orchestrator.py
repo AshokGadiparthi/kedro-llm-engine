@@ -75,6 +75,7 @@ class InsightBundle:
         self.memory_applied: List[Dict] = []
         self.critical_count: int = 0
         self.warning_count: int = 0
+        self.suggested_questions: List[str] = []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -87,6 +88,7 @@ class InsightBundle:
             "context_summary": self.context_summary,
             "timing": self.timing,
             "memory_applied": self.memory_applied,
+            "suggested_questions": self.suggested_questions,
             "counts": {
                 "critical": self.critical_count,
                 "warning": self.warning_count,
@@ -211,6 +213,7 @@ class AgentOrchestrator:
 
         # Cache
         self._cache = _AnalysisCache(max_size=50, ttl_seconds=300)
+        self._ai_cache = _AnalysisCache(max_size=30, ttl_seconds=1800)  # 30 min TTL for AI responses
 
     # ──────────────────────────────────────────────────────────
     # 1. GET INSIGHTS (main pipeline)
@@ -279,6 +282,19 @@ class AgentOrchestrator:
             order = {"critical": 0, "warning": 1, "info": 2, "tip": 3, "success": 4}
             raw_insights.sort(key=lambda x: (order.get(x.severity, 99), -(x.confidence or 0)))
 
+            # ── Deduplicate: same rule_id should appear only once ──
+            seen_rules = set()
+            deduped = []
+            for insight in raw_insights:
+                key = insight.rule_id or ""
+                if key and key in seen_rules:
+                    logger.debug(f"Dedup: skipping duplicate insight {key}")
+                    continue
+                if key:
+                    seen_rules.add(key)
+                deduped.append(insight)
+            raw_insights = deduped
+
             bundle.insights = [i.to_dict() for i in raw_insights]
             bundle.critical_count = sum(1 for i in raw_insights if i.severity == "critical")
             bundle.warning_count = sum(1 for i in raw_insights if i.severity == "warning")
@@ -328,6 +344,11 @@ class AgentOrchestrator:
             # ── Build context summary ──
             bundle.context_summary = self._build_context_summary(context, analysis)
             bundle.timing = timings
+
+            # ── Generate dynamic suggested questions ──
+            bundle.suggested_questions = self._generate_suggested_questions(
+                raw_insights, context, screen
+            )
 
         except Exception as e:
             logger.error(f"Orchestrator.get_insights failed: {e}", exc_info=True)
@@ -403,19 +424,40 @@ class AgentOrchestrator:
                 qa_confidence=qa_result["confidence"],
             )
             if should_use:
-                try:
-                    llm_result = await self.llm_reasoner.reason(
-                        context,
-                        [i.to_dict() for i in raw_insights[:8]],
-                        question=question,
-                    )
-                    has_llm = getattr(llm_result, 'has_llm', False) if not isinstance(llm_result, dict) else llm_result.get("has_llm", False)
-                    if has_llm:
-                        bundle.answer = getattr(llm_result, 'advice', bundle.answer) if not isinstance(llm_result, dict) else llm_result.get("advice", bundle.answer)
-                        src = getattr(llm_result, 'source', '') if not isinstance(llm_result, dict) else llm_result.get("source", "")
-                        bundle.source = f"llm_enhanced:{src}"
-                except Exception as e:
-                    logger.warning(f"LLM enhancement failed: {e}")
+                # Check AI cache first (same dataset + question = same answer)
+                ai_cache_key = None
+                if dataset_id:
+                    q_hash = hashlib.md5(question.encode()).hexdigest()[:12]
+                    ai_cache_key = ("ai_ask", dataset_id, q_hash)
+                    cached_ai = self._ai_cache.get(ai_cache_key)
+                    if cached_ai:
+                        bundle.answer = cached_ai["answer"]
+                        bundle.source = cached_ai["source"] + ":cached"
+                        logger.info(f"AI cache hit for {ai_cache_key} — saved ~$0.02")
+                        should_use = False  # skip LLM call
+
+                if should_use:
+                    try:
+                        llm_result = await self.llm_reasoner.reason(
+                            context,
+                            [i.to_dict() for i in raw_insights[:8]],
+                            question=question,
+                        )
+                        has_llm = getattr(llm_result, 'has_llm', False) if not isinstance(llm_result, dict) else llm_result.get("has_llm", False)
+                        if has_llm:
+                            answer = getattr(llm_result, 'advice', bundle.answer) if not isinstance(llm_result, dict) else llm_result.get("advice", bundle.answer)
+                            src = getattr(llm_result, 'source', '') if not isinstance(llm_result, dict) else llm_result.get("source", "")
+                            bundle.answer = answer
+                            bundle.source = f"llm_enhanced:{src}"
+
+                            # Store in AI cache
+                            if ai_cache_key:
+                                self._ai_cache.set(
+                                    {"answer": bundle.answer, "source": bundle.source},
+                                    ai_cache_key,
+                                )
+                    except Exception as e:
+                        logger.warning(f"LLM enhancement failed: {e}")
             else:
                 logger.info(f"LLM skipped for /ask (use_llm={use_llm}, confidence={qa_result['confidence']:.2f}) — saved ~$0.01")
             timings["llm_enhancement"] = round(time.time() - t0, 3)
@@ -805,6 +847,7 @@ class AgentOrchestrator:
         profile = context.get("dataset_profile", {})
         quality = context.get("data_quality", {})
         pipeline = context.get("pipeline_state", {})
+        screen = context.get("screen", "")
 
         readiness = analysis.get("data_readiness", {})
         readiness_score = 0
@@ -813,8 +856,84 @@ class AgentOrchestrator:
             if hasattr(readiness, "overall_score"):
                 readiness_score = readiness.overall_score
 
+        # Dashboard: show project-level summary, not dataset-level
+        if screen == "dashboard":
+            registry = context.get("registry_info", {}) or {}
+            training = context.get("training_history", {}) or {}
+            frontend = context.get("frontend_state", {}) or {}
+            return {
+                "screen": "dashboard",
+                "project_id": context.get("project_id"),
+                "total_models": registry.get("total_registered", 0) or frontend.get("total_models", 0),
+                "total_datasets": frontend.get("total_datasets", 0),
+                "avg_accuracy": frontend.get("avg_accuracy", 0),
+                "deployed_models": frontend.get("deployed_models", 0),
+                "total_predictions": frontend.get("total_predictions", 0),
+                "completed_jobs": training.get("completed_jobs", 0),
+                "failed_jobs": training.get("failed_jobs", 0),
+                "quality_score": quality.get("overall_quality_score", 0),
+                "data_readiness_score": readiness_score,
+                "phases_completed": pipeline.get("phases_completed", []),
+                "last_phase": pipeline.get("last_phase"),
+                "next_phase": pipeline.get("next_recommended_phase"),
+            }
+
+        # AI Insights hub: merged project + dataset summary
+        if screen == "ai_insights":
+            registry = context.get("registry_info", {}) or {}
+            training = context.get("training_history", {}) or {}
+            frontend = context.get("frontend_state", {}) or {}
+            versions = context.get("model_versions", {}) or {}
+            return {
+                "screen": "ai_insights",
+                "project_id": context.get("project_id"),
+                "dataset_id": context.get("dataset_id"),
+                # Data info
+                "rows": profile.get("rows", 0),
+                "columns": profile.get("columns", 0),
+                "numeric_count": profile.get("numeric_count", 0),
+                "categorical_count": profile.get("categorical_count", 0),
+                "completeness": quality.get("completeness", 100),
+                "quality_score": quality.get("overall_quality_score", 0),
+                "duplicate_pct": quality.get("duplicate_pct", 0),
+                "data_readiness_score": readiness_score,
+                # Model info
+                "total_models": registry.get("total_registered", 0) or frontend.get("total_models", 0),
+                "total_datasets": frontend.get("total_datasets", 0),
+                "deployed_models": frontend.get("deployed_models", 0),
+                "total_versions": len((versions.get("versions") or [])),
+                "avg_accuracy": frontend.get("avg_accuracy", 0),
+                "total_predictions": frontend.get("total_predictions", 0),
+                # Pipeline
+                "completed_jobs": training.get("completed_jobs", 0),
+                "failed_jobs": training.get("failed_jobs", 0),
+                "phases_completed": pipeline.get("phases_completed", []),
+                "next_phase": pipeline.get("next_recommended_phase"),
+            }
+
+        # ── Auto-detected target info ──
+        target_info = context.get("target_variable", {}) or {}
+        target_name = target_info.get("name")
+        target_type = target_info.get("type")
+        minority_pct = target_info.get("minority_class_pct")
+
+        # ── Readiness breakdown ──
+        readiness_breakdown = {}
+        if isinstance(readiness, dict):
+            readiness_breakdown = {
+                "overall": readiness.get("overall_score", readiness_score),
+                "completeness": readiness.get("completeness_score", 0),
+                "quality": readiness.get("quality_score", 0),
+                "features": readiness.get("feature_score", 0),
+                "target": readiness.get("target_score", 0),
+                "complexity": readiness.get("complexity_score", 0),
+                "difficulty": readiness.get("estimated_difficulty", "unknown"),
+                "strengths": readiness.get("strengths", []),
+                "bottlenecks": readiness.get("bottlenecks", []),
+            }
+
         return {
-            "screen": context.get("screen"),
+            "screen": screen,
             "rows": profile.get("rows", 0),
             "columns": profile.get("columns", 0),
             "numeric_count": profile.get("numeric_count", 0),
@@ -823,6 +942,10 @@ class AgentOrchestrator:
             "quality_score": quality.get("overall_quality_score", 100),
             "duplicate_pct": quality.get("duplicate_pct", 0),
             "data_readiness_score": readiness_score,
+            "readiness": readiness_breakdown,
+            "target_column": target_name,
+            "target_type": target_type,
+            "target_minority_pct": minority_pct,
             "phases_completed": pipeline.get("phases_completed", []),
             "last_phase": pipeline.get("last_phase"),
             "next_phase": pipeline.get("next_recommended_phase"),
@@ -904,6 +1027,82 @@ class AgentOrchestrator:
 
         # Auto mode — only enhance low-confidence answers
         return qa_confidence < 0.7
+
+    def _generate_suggested_questions(
+            self,
+            insights: List,
+            context: Dict,
+            screen: str,
+    ) -> List[str]:
+        """
+        Generate dynamic suggested questions based on fired insights.
+        Returns 3-5 dataset-specific questions for the frontend chips.
+        """
+        questions = []
+        rule_ids = {getattr(i, "rule_id", "") or "" for i in insights}
+        severities = {getattr(i, "severity", "") or "" for i in insights}
+        profile = context.get("dataset_profile", {})
+        rows = profile.get("rows", 0)
+        num_count = profile.get("numeric_count", 0)
+        cat_count = profile.get("categorical_count", 0)
+
+        # Critical issues
+        critical = [i for i in insights if getattr(i, "severity", "") == "critical"]
+        if critical:
+            questions.append(
+                f"How do I fix the {len(critical)} critical issues before training?"
+            )
+
+        # Data leakage
+        if any(r.startswith("DL-") for r in rule_ids):
+            questions.append("Explain the data leakage risk and how to fix it")
+
+        # Feature engineering
+        fe_rules = [r for r in rule_ids if r.startswith("FE-")]
+        if fe_rules:
+            questions.append(
+                f"Which feature engineering step will improve accuracy the most?"
+            )
+
+        # High cardinality / encoding
+        if "FH-004" in rule_ids or cat_count > 10:
+            questions.append(
+                f"What's the best encoding for my {cat_count} categorical features?"
+            )
+
+        # Type mismatch (DQ-010)
+        if "DQ-010" in rule_ids:
+            questions.append(
+                "How do I fix columns stored as wrong data type?"
+            )
+
+        # Small dataset
+        if rows < 5000:
+            questions.append(
+                f"Is {rows:,} rows enough? What techniques work for small datasets?"
+            )
+
+        # Target variable
+        target_rules = [r for r in rule_ids if r.startswith("TV-")]
+        if not target_rules:
+            questions.append(
+                "What accuracy should I expect with this data?"
+            )
+
+        # Algorithm selection
+        if "FH-006" in rule_ids:
+            questions.append(
+                "Which algorithm handles my mixed feature types best?"
+            )
+
+        # Trim to 5 and ensure no duplicates
+        seen = set()
+        unique_questions = []
+        for q in questions:
+            if q not in seen:
+                seen.add(q)
+                unique_questions.append(q)
+        return unique_questions[:5]
 
     def _generate_rules_synthesis(
             self,
