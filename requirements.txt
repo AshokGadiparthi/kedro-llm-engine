@@ -1,0 +1,32 @@
+# ML Expert Agent Engine — Dependencies
+# ========================================
+# Install: pip install -r requirements.txt
+
+# ── Core Framework ──
+fastapi>=0.104.0,<1.0.0
+uvicorn[standard]>=0.24.0,<1.0.0
+pydantic>=2.0.0,<3.0.0
+
+# ── Database ──
+sqlalchemy>=2.0.0,<3.0.0
+
+# ── HTTP Client (for LLM Reasoner — OpenAI/Anthropic/Azure calls) ──
+httpx>=0.25.0,<1.0.0
+
+# ── Database Drivers (uncomment what you need) ──
+# PostgreSQL (production):
+# psycopg2-binary>=2.9.0,<3.0.0
+
+# MySQL:
+# pymysql>=1.1.0,<2.0.0
+
+# SQLite: included in Python stdlib — no driver needed
+
+# ── Optional: Enhanced Statistical Tests (pure-Python fallback works without) ──
+# scipy>=1.11.0,<2.0.0
+# numpy>=1.24.0,<2.0.0
+
+# ── Optional: Testing ──
+# pytest>=7.4.0,<9.0.0
+# pytest-asyncio>=0.21.0,<1.0.0
+# pytest-cov>=4.1.0,<6.0.0
