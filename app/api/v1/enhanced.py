@@ -207,7 +207,7 @@ async def get_enhanced_insights(request: EnhancedInsightRequest, db=Depends(get_
     """Domain-aware auto-insights with adaptive thresholds + feedback adjustment."""
     try:
         orchestrator = _get_enhanced_orchestrator(db)
-        bundle = await orchestrator.get_insights(
+        result = orchestrator.get_insights(
             user_id=request.user_id or "anonymous",
             screen=request.screen,
             frontend_state=request.extra,
@@ -215,7 +215,13 @@ async def get_enhanced_insights(request: EnhancedInsightRequest, db=Depends(get_
             user_domain=request.user_domain,
             user_threshold_overrides=request.threshold_overrides,
         )
-        return bundle.to_dict() if hasattr(bundle, "to_dict") else bundle
+        # Handle async coroutine if base orchestrator returns one
+        import asyncio
+        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+            result = await result
+        if hasattr(result, "to_dict"):
+            return result.to_dict()
+        return result
     except Exception as e:
         logger.error(f"Enhanced insights error: {e}", exc_info=True)
         return {"insights": [], "error": str(e)}
@@ -226,7 +232,7 @@ async def enhanced_ask(request: EnhancedAskRequest, db=Depends(get_db)):
     """Semantic intent Q&A — handles paraphrases, slang, and screen context."""
     try:
         orchestrator = _get_enhanced_orchestrator(db)
-        result = await orchestrator.ask(
+        result = orchestrator.ask(
             user_id=request.user_id or "anonymous",
             question=request.question,
             screen=request.screen or "general",
@@ -234,7 +240,13 @@ async def enhanced_ask(request: EnhancedAskRequest, db=Depends(get_db)):
             conversation_history=request.conversation_history,
             extra=request.extra,
         )
-        return result.to_dict() if hasattr(result, "to_dict") else result
+        # Handle async coroutine if base orchestrator returns one
+        import asyncio
+        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+            result = await result
+        if hasattr(result, "to_dict"):
+            return result.to_dict()
+        return result
     except Exception as e:
         logger.error(f"Enhanced ask error: {e}", exc_info=True)
         return {"answer": f"Error: {str(e)}", "source": "error"}
