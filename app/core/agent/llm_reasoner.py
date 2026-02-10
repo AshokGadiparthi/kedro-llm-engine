@@ -43,11 +43,11 @@ class LLMConfig:
     model: str = ""
     api_key: str = ""
     base_url: str = ""
-    max_tokens: int = 1500
+    max_tokens: int = 800
     temperature: float = 0.3
-    timeout_seconds: int = 15
-    max_retries: int = 2
-    token_budget_per_request: int = 4000
+    timeout_seconds: int = 30
+    max_retries: int = 1
+    token_budget_per_request: int = 2000
     cache_ttl_seconds: int = 300
 
     @classmethod
@@ -85,15 +85,14 @@ class LLMResponse:
         return {k: v for k, v in self.__dict__.items() if k != "fact_check_issues"}
 
 
-SYSTEM_PROMPT = """You are a world-class Principal ML Architect embedded inside a production ML platform.
-EXPERTISE: Statistics, ML, deep learning, MLOps, data engineering, production systems.
+SYSTEM_PROMPT = """You are a Principal ML Architect embedded in a production ML platform.
 RULES:
 1. NEVER invent metrics not in the context
 2. Reference specific numbers from context
 3. Provide CONCRETE next steps with parameters
-4. Explain WHY, not just WHAT
+4. Be CONCISE — max 300 words. No preamble, no filler.
 5. Present trade-offs with quantified impact
-TONE: Direct, expert, no fluff. FORMAT: Short paragraphs, **bold** for key terms."""
+FORMAT: Short paragraphs, **bold** key terms. No headers larger than ##."""
 
 SCREEN_PROMPTS = {
     "eda": "Focus on data quality, feature distributions, correlations, target health, transformations.",
@@ -212,13 +211,22 @@ class _AnthropicClient(_BaseClient):
         body = {"model": config.model or "claude-sonnet-4-20250514", "max_tokens": config.max_tokens, "messages": user_msgs}
         if system_msg:
             body["system"] = system_msg
-        async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
+        # Enforce proper total timeout — connect fast, allow read time for LLM generation
+        timeout = httpx.Timeout(
+            connect=5.0,
+            read=float(config.timeout_seconds),    # Time for LLM to generate
+            write=5.0,
+            pool=5.0,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", json=body, headers=headers)
             resp.raise_for_status()
             data = resp.json()
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-        tokens = data.get("usage", {}).get("input_tokens", 0) + data.get("usage", {}).get("output_tokens", 0)
-        return text, tokens
+        tokens_in = data.get("usage", {}).get("input_tokens", 0)
+        tokens_out = data.get("usage", {}).get("output_tokens", 0)
+        logger.info(f"Anthropic API: {tokens_in} in + {tokens_out} out tokens, model={body['model']}")
+        return text, tokens_in + tokens_out
 
 
 class _OllamaClient(_BaseClient):
