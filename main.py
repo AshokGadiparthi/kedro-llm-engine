@@ -16,6 +16,13 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+# Load .env file BEFORE anything reads os.getenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, use system env vars only
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
