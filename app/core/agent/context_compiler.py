@@ -81,14 +81,46 @@ class ContextCompiler:
 
     def __init__(self, db_session):
         self.db = db_session
+        self._table_columns: Dict[str, set] = {}   # Cache of real DB columns
+        self._schema_checked = False
+
+    # ── Schema Discovery ──────────────────────────────────────
+    def _discover_table_columns(self, table_name: str) -> set:
+        """Discover which columns actually exist in a DB table (cached)."""
+        if table_name in self._table_columns:
+            return self._table_columns[table_name]
+        try:
+            from sqlalchemy import inspect as sa_inspect
+            inspector = sa_inspect(self.db.bind)
+            cols = {c["name"] for c in inspector.get_columns(table_name)}
+            self._table_columns[table_name] = cols
+            if not self._schema_checked:
+                logger.info(f"Schema discovery: {table_name} has columns: {sorted(cols)}")
+            return cols
+        except Exception as e:
+            logger.warning(f"Schema discovery failed for {table_name}: {e}")
+            return set()
+
+    def _has_column(self, table_name: str, column_name: str) -> bool:
+        """Check if a column exists in the actual database table."""
+        return column_name in self._discover_table_columns(table_name)
+
+    @staticmethod
+    def _ga(obj, *attrs, default=None):
+        """Get first available attribute from an object. Handles missing columns safely."""
+        for attr in attrs:
+            val = getattr(obj, attr, None)
+            if val is not None:
+                return val
+        return default
 
     async def compile(
-        self,
-        screen: str,
-        project_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-        model_id: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None,
+            self,
+            screen: str,
+            project_id: Optional[str] = None,
+            dataset_id: Optional[str] = None,
+            model_id: Optional[str] = None,
+            extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Compile complete context for a given screen."""
         ctx: Dict[str, Any] = {
@@ -124,6 +156,7 @@ class ContextCompiler:
             "deployment": self._enrich_deployment,
             "predictions": self._enrich_predictions,
             "monitoring": self._enrich_monitoring,
+            "ai_insights": self._enrich_ai_insights,
         }.get(screen)
 
         if enricher:
@@ -409,34 +442,57 @@ class ContextCompiler:
             return None
 
     async def _get_training_history(self, project_id: str) -> Dict[str, Any]:
-        """Get history of pipeline training jobs."""
+        """Get history of pipeline training jobs — resilient to schema differences."""
         from app.models.models import Job
         result = {"total_jobs": 0, "completed_jobs": 0, "failed_jobs": 0, "running_jobs": 0,
                   "recent_jobs": [], "avg_execution_time": 0.0, "pipelines_run": []}
         try:
-            jobs = self.db.query(Job).filter(Job.user_id.isnot(None)).order_by(Job.created_at.desc()).limit(50).all()
+            # Discover which columns the jobs table actually has
+            job_cols = self._discover_table_columns("jobs")
+
+            # Build query — only filter by project_id if column exists
+            query = self.db.query(Job)
+            if "project_id" in job_cols and project_id:
+                query = query.filter(Job.project_id == project_id)
+            elif "user_id" in job_cols:
+                query = query.filter(Job.user_id.isnot(None))
+
+            if "created_at" in job_cols:
+                query = query.order_by(Job.created_at.desc())
+            jobs = query.limit(50).all()
+
             result["total_jobs"] = len(jobs)
             total_time = 0.0
             pipes = set()
             for job in jobs:
-                st = (job.status or "unknown").lower()
+                st = (self._ga(job, "status") or "unknown").lower()
                 if st == "completed":
                     result["completed_jobs"] += 1
                 elif st == "failed":
                     result["failed_jobs"] += 1
                 elif st in ("running", "pending"):
                     result["running_jobs"] += 1
-                pipes.add(job.pipeline_name or "unknown")
-                et = _sf(job.execution_time, 0)
+
+                # pipeline_name may be stored as pipeline_name, job_type, or type
+                pipe = self._ga(job, "pipeline_name", "job_type", "type", default="unknown")
+                pipes.add(pipe)
+
+                # execution_time may be stored as execution_time, duration_seconds, or duration
+                et = _sf(self._ga(job, "execution_time", "duration_seconds", "duration"), 0)
                 if et > 0:
                     total_time += et
+
                 if len(result["recent_jobs"]) < 10:
                     result["recent_jobs"].append({
-                        "id": job.id, "pipeline": job.pipeline_name, "status": st,
+                        "id": job.id,
+                        "pipeline": pipe,
+                        "status": st,
+                        "algorithm": self._ga(job, "algorithm"),
                         "execution_time": et,
-                        "created_at": job.created_at.isoformat() if job.created_at else None,
-                        "parameters": _safe_json(job.parameters, {}),
-                        "error": job.error_message if st == "failed" else None,
+                        "created_at": job.created_at.isoformat() if getattr(job, "created_at", None) else None,
+                        "parameters": _safe_json(self._ga(job, "parameters", "config", "configuration"), {}),
+                        "metrics": _safe_json(self._ga(job, "metrics"), {}),
+                        "error": self._ga(job, "error_message", "error") if st == "failed" else None,
                     })
             result["pipelines_run"] = sorted(pipes)
             if result["completed_jobs"] > 0:
@@ -446,28 +502,77 @@ class ContextCompiler:
         return result
 
     async def _get_registry_info(self, project_id: str, model_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get model registry metadata."""
-        from app.models.models import RegisteredModel
+        """Get model registry metadata — resilient to schema differences."""
+        from app.models.models import RegisteredModel, ModelVersion
         result = {"total_registered": 0, "production_models": 0, "deployed_models": 0, "models": [], "selected_model": None}
         try:
-            models = self.db.query(RegisteredModel).filter(RegisteredModel.project_id == project_id).all()
+            # Discover which columns actually exist
+            rm_cols = self._discover_table_columns("registered_models")
+            mv_cols = self._discover_table_columns("model_versions")
+
+            # Build query — only filter by project_id if column exists
+            query = self.db.query(RegisteredModel)
+            if "project_id" in rm_cols and project_id:
+                query = query.filter(RegisteredModel.project_id == project_id)
+            models = query.all()
+
             result["total_registered"] = len(models)
+
             for m in models[:20]:
+                # Get status — could be current_stage, status, or stage
+                status = self._ga(m, "current_stage", "status", "stage", default="draft")
+
+                # Get algorithm — could be on model itself or derived from versions
+                algo = self._ga(m, "algorithm", "best_algorithm")
+
+                # Get metrics from JSON column if available
+                metrics_json = _safe_json(self._ga(m, "metrics"), {})
+
+                # Derive accuracy from metrics JSON or direct column
+                best_acc = _sf(
+                    self._ga(m, "best_accuracy")
+                    or metrics_json.get("accuracy")
+                    or metrics_json.get("best_accuracy")
+                    or metrics_json.get("f1_score"),
+                    0.0
+                )
+
+                # Check deployment — could be is_deployed flag, or stage == "production"
+                is_deployed = bool(self._ga(m, "is_deployed", default=False))
+                if not is_deployed and status and status.lower() in ("production", "deployed", "serving"):
+                    is_deployed = True
+
+                # Total versions — could be a column or needs count query
+                total_v = _si(self._ga(m, "total_versions"), 0)
+                if total_v == 0 and mv_cols:
+                    try:
+                        total_v = self.db.query(ModelVersion).filter(ModelVersion.model_id == m.id).count()
+                    except Exception:
+                        total_v = 0
+
                 info = {
-                    "id": m.id, "name": m.name, "status": m.status or "draft",
-                    "best_accuracy": _sf(m.best_accuracy), "best_algorithm": m.best_algorithm,
-                    "is_deployed": bool(m.is_deployed), "total_versions": _si(m.total_versions, 1),
-                    "current_version": m.current_version,
-                    "problem_type": getattr(m, "problem_type", None),
-                    "source_dataset_name": getattr(m, "source_dataset_name", None),
+                    "id": m.id,
+                    "name": self._ga(m, "name", default="unnamed"),
+                    "status": status,
+                    "best_accuracy": best_acc,
+                    "best_algorithm": algo or metrics_json.get("algorithm"),
+                    "is_deployed": is_deployed,
+                    "total_versions": total_v,
+                    "current_version": self._ga(m, "current_version"),
+                    "problem_type": self._ga(m, "problem_type"),
+                    "framework": self._ga(m, "framework"),
+                    "source_dataset_name": self._ga(m, "source_dataset_name"),
+                    "description": self._ga(m, "description"),
                 }
                 result["models"].append(info)
-                if (m.status or "").lower() == "production":
+
+                if status and status.lower() == "production":
                     result["production_models"] += 1
-                if m.is_deployed:
+                if is_deployed:
                     result["deployed_models"] += 1
                 if model_id and m.id == model_id:
                     result["selected_model"] = info
+
         except Exception as e:
             logger.warning(f"registry info error: {e}")
         return result
@@ -481,39 +586,55 @@ class ContextCompiler:
             if model_id:
                 query = query.filter(ModelVersion.model_id == model_id)
             else:
-                mids = [m.id for m in self.db.query(RegisteredModel.id).filter(RegisteredModel.project_id == project_id).all()]
+                # Query only RegisteredModel.id — safe even if other columns removed
+                rm_cols = self._discover_table_columns("registered_models")
+                if "project_id" in rm_cols and project_id:
+                    mids = [m.id for m in self.db.query(RegisteredModel.id).filter(RegisteredModel.project_id == project_id).all()]
+                else:
+                    mids = [m.id for m in self.db.query(RegisteredModel.id).all()]
                 if not mids:
                     return result
                 query = query.filter(ModelVersion.model_id.in_(mids))
-            versions = query.order_by(ModelVersion.created_at.desc()).limit(30).all()
+
+            mv_cols = self._discover_table_columns("model_versions")
+            if "created_at" in mv_cols:
+                query = query.order_by(ModelVersion.created_at.desc())
+            versions = query.limit(30).all()
+
             result["total_versions"] = len(versions)
             best_f1 = -1
             algo_met = {}
             for v in versions:
                 vi = {
-                    "id": v.id, "model_id": v.model_id, "version": v.version,
-                    "is_current": bool(v.is_current), "status": v.status or "draft",
-                    "algorithm": v.algorithm,
+                    "id": v.id,
+                    "model_id": getattr(v, "model_id", None),
+                    "version": getattr(v, "version", None),
+                    "is_current": bool(getattr(v, "is_current", False)),
+                    "status": getattr(v, "status", None) or "draft",
+                    "algorithm": getattr(v, "algorithm", None),
                     "metrics": {
-                        "accuracy": _sf(v.accuracy), "precision": _sf(v.precision),
-                        "recall": _sf(v.recall), "f1_score": _sf(v.f1_score),
-                        "train_score": _sf(v.train_score), "test_score": _sf(v.test_score),
-                        "roc_auc": _sf(v.roc_auc),
+                        "accuracy": _sf(getattr(v, "accuracy", None)),
+                        "precision": _sf(getattr(v, "precision", None)),
+                        "recall": _sf(getattr(v, "recall", None)),
+                        "f1_score": _sf(getattr(v, "f1_score", None)),
+                        "train_score": _sf(getattr(v, "train_score", None)),
+                        "test_score": _sf(getattr(v, "test_score", None)),
+                        "roc_auc": _sf(getattr(v, "roc_auc", None)),
                     },
-                    "training_time_seconds": _sf(v.training_time_seconds),
-                    "model_size_mb": _sf(v.model_size_mb),
-                    "hyperparameters": _safe_json(v.hyperparameters, {}),
-                    "feature_names": _safe_json(v.feature_names, []),
-                    "feature_importances": _safe_json(v.feature_importances, {}),
-                    "confusion_matrix": _safe_json(v.confusion_matrix, None),
-                    "training_config": _safe_json(v.training_config, {}),
+                    "training_time_seconds": _sf(getattr(v, "training_time_seconds", None)),
+                    "model_size_mb": _sf(getattr(v, "model_size_mb", None)),
+                    "hyperparameters": _safe_json(getattr(v, "hyperparameters", None), {}),
+                    "feature_names": _safe_json(getattr(v, "feature_names", None), []),
+                    "feature_importances": _safe_json(getattr(v, "feature_importances", None), {}),
+                    "confusion_matrix": _safe_json(getattr(v, "confusion_matrix", None), None),
+                    "training_config": _safe_json(getattr(v, "training_config", None), {}),
                 }
                 result["versions"].append(vi)
-                f1 = _sf(v.f1_score, -1)
+                f1 = _sf(getattr(v, "f1_score", None), -1)
                 if f1 > best_f1:
                     best_f1 = f1
                     result["best_version"] = vi
-                algo = v.algorithm or "unknown"
+                algo = getattr(v, "algorithm", None) or "unknown"
                 algo_met.setdefault(algo, []).append(vi["metrics"])
             for algo, ml in algo_met.items():
                 result["algorithm_comparison"][algo] = {
@@ -532,27 +653,40 @@ class ContextCompiler:
         return result
 
     async def _get_pipeline_state(self, project_id: str) -> Dict[str, Any]:
-        """Determine which Kedro pipeline phases have been executed."""
+        """Determine which pipeline phases have been executed — resilient to schema differences."""
         from app.models.models import Job
         phase_map = {
             "data_loading": ("Phase 1: Data Loading", 1),
             "feature_engineering": ("Phase 2: Feature Engineering", 2),
             "model_training": ("Phase 3: Model Training", 3),
+            "training": ("Phase 3: Model Training", 3),
             "phase4": ("Phase 4: Algorithm Comparison", 4),
             "multi_algorithm": ("Phase 4: Algorithm Comparison", 4),
             "phase5": ("Phase 5: Deep Evaluation", 5),
             "analysis": ("Phase 5: Deep Evaluation", 5),
+            "evaluation": ("Phase 5: Deep Evaluation", 5),
             "phase6": ("Phase 6: Ensemble", 6),
             "ensemble": ("Phase 6: Ensemble", 6),
             "end_to_end": ("End-to-End Pipeline", 0),
         }
         result = {"phases_completed": [], "phases_failed": [], "last_phase": None, "next_recommended_phase": None}
         try:
-            jobs = self.db.query(Job).order_by(Job.created_at.desc()).limit(100).all()
+            # Discover which columns the jobs table actually has
+            job_cols = self._discover_table_columns("jobs")
+
+            query = self.db.query(Job)
+            if "project_id" in job_cols and project_id:
+                query = query.filter(Job.project_id == project_id)
+
+            if "created_at" in job_cols:
+                query = query.order_by(Job.created_at.desc())
+            jobs = query.limit(100).all()
+
             completed, failed = set(), set()
             for job in jobs:
-                pl = (job.pipeline_name or "").lower()
-                st = (job.status or "").lower()
+                # pipeline_name may be stored as pipeline_name, job_type, or type
+                pl = (self._ga(job, "pipeline_name", "job_type", "type", default="") or "").lower()
+                st = (self._ga(job, "status", default="") or "").lower()
                 for key, (label, _) in phase_map.items():
                     if key in pl:
                         (completed if st == "completed" else failed).add(label)
@@ -579,6 +713,45 @@ class ContextCompiler:
         p = ctx.get("pipeline_state", {})
         return {"view": "overview", "needs_guidance": not t.get("completed_jobs"),
                 "has_models": r.get("total_registered", 0) > 0, "next_step": p.get("next_recommended_phase")}
+
+    async def _enrich_ai_insights(self, ctx, extra):
+        """Comprehensive enrichment for dedicated AI Insights screen — merges all screen contexts."""
+        t = ctx.get("training_history", {}) or {}
+        r = ctx.get("registry_info", {}) or {}
+        p = ctx.get("pipeline_state", {}) or {}
+        q = ctx.get("data_quality", {}) or {}
+        v = ctx.get("model_versions", {}) or {}
+        frontend = extra or {}
+
+        return {
+            "view": "ai_insights_hub",
+            # Dashboard-level context
+            "has_models": r.get("total_registered", 0) > 0,
+            "needs_guidance": not t.get("completed_jobs"),
+            "next_step": p.get("next_recommended_phase"),
+            # Training context
+            "target_column": frontend.get("target_column"),
+            "algorithm": frontend.get("algorithm"),
+            "selected_features": frontend.get("selected_features", []),
+            "problem_type": frontend.get("problem_type", "classification"),
+            "test_size": frontend.get("test_size", 0.2),
+            "scaling_method": frontend.get("scaling_method", "standard"),
+            "cv_folds": frontend.get("cv_folds", 5),
+            "stratified": frontend.get("stratified", True),
+            # Evaluation context
+            "metrics": frontend.get("metrics", {}),
+            "threshold": frontend.get("threshold", 0.5),
+            "confusion_matrix": frontend.get("confusion_matrix"),
+            "feature_importances": frontend.get("feature_importances"),
+            "overall_score": frontend.get("overall_score"),
+            "model_name": frontend.get("model_name"),
+            # Frontend stats for dashboard rules
+            "total_models": frontend.get("total_models", 0),
+            "deployed_models": frontend.get("deployed_models", 0),
+            "total_datasets": frontend.get("total_datasets", 0),
+            "avg_accuracy": frontend.get("avg_accuracy"),
+            "total_predictions": frontend.get("total_predictions", 0),
+        }
 
     async def _enrich_data(self, ctx, extra):
         return {"view": "data_management", "uploaded_datasets": bool(ctx.get("dataset_id")), "active_tab": extra.get("active_tab", "overview")}
