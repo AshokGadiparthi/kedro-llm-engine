@@ -48,6 +48,14 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables ready")
 
+    # Adapt models to match REAL database schema
+    # (removes declared columns that don't exist in the actual DB)
+    try:
+        from app.models.platform import adapt_models_to_schema
+        adapt_models_to_schema(engine)
+    except Exception as e:
+        logger.warning(f"Schema adaptation failed (non-fatal): {e}")
+
     # Warm up engine
     try:
         from app.core.agent.rule_engine import RuleEngine
