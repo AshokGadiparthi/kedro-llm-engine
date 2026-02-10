@@ -108,7 +108,7 @@ class EnhancedOrchestrator:
     # ENHANCED: get_insights — now with domain-aware thresholds
     # ──────────────────────────────────────────────────────────
 
-    def get_insights(
+    async def get_insights(
         self,
         user_id: str,
         screen: str,
@@ -144,11 +144,15 @@ class EnhancedOrchestrator:
             except Exception as e:
                 logger.warning(f"Domain detection failed: {e}")
 
-        # Call original orchestrator
+        # Call original orchestrator (base does NOT accept frontend_state)
         result = self._base.get_insights(
-            user_id=user_id, screen=screen,
-            frontend_state=frontend_state, extra=extra,
+            user_id=user_id, screen=screen, extra=extra,
         )
+
+        # Await if coroutine (base orchestrator is async)
+        import asyncio
+        if asyncio.iscoroutine(result):
+            result = await result
 
         # Log recommendations for feedback tracking
         if self._feedback and result:
@@ -160,7 +164,7 @@ class EnhancedOrchestrator:
     # ENHANCED: ask — now with semantic intent classification
     # ──────────────────────────────────────────────────────────
 
-    def ask(
+    async def ask(
         self,
         user_id: str,
         question: str,
@@ -190,13 +194,17 @@ class EnhancedOrchestrator:
             except Exception as e:
                 logger.warning(f"Semantic classification failed: {e}")
 
-        # Call original orchestrator
+        # Call original orchestrator (base does NOT accept frontend_state)
         result = self._base.ask(
             user_id=user_id, question=question, screen=screen,
-            frontend_state=frontend_state,
             conversation_history=conversation_history,
             extra=extra,
         )
+
+        # Await if coroutine (base orchestrator is async)
+        import asyncio
+        if asyncio.iscoroutine(result):
+            result = await result
 
         # Enrich with semantic metadata
         if semantic_intent and isinstance(result, dict):

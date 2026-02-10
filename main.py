@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
         _sc = SemanticIntentClassifier()
         _dp = DomainProfileManager.list_domains()
         logger.info(
-            f"Engine warmed up: {len(_re._rules)} rules, "
+            f"Engine warmed up: RuleEngine ready, "
             f"semantic classifier ready, {len(_dp)} domain profiles"
         )
     except Exception as e:

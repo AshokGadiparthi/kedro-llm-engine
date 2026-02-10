@@ -207,7 +207,7 @@ async def get_enhanced_insights(request: EnhancedInsightRequest, db=Depends(get_
     """Domain-aware auto-insights with adaptive thresholds + feedback adjustment."""
     try:
         orchestrator = _get_enhanced_orchestrator(db)
-        result = orchestrator.get_insights(
+        result = await orchestrator.get_insights(
             user_id=request.user_id or "anonymous",
             screen=request.screen,
             frontend_state=request.extra,
@@ -215,10 +215,6 @@ async def get_enhanced_insights(request: EnhancedInsightRequest, db=Depends(get_
             user_domain=request.user_domain,
             user_threshold_overrides=request.threshold_overrides,
         )
-        # Handle async coroutine if base orchestrator returns one
-        import asyncio
-        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-            result = await result
         if hasattr(result, "to_dict"):
             return result.to_dict()
         return result
@@ -232,7 +228,7 @@ async def enhanced_ask(request: EnhancedAskRequest, db=Depends(get_db)):
     """Semantic intent Q&A — handles paraphrases, slang, and screen context."""
     try:
         orchestrator = _get_enhanced_orchestrator(db)
-        result = orchestrator.ask(
+        result = await orchestrator.ask(
             user_id=request.user_id or "anonymous",
             question=request.question,
             screen=request.screen or "general",
@@ -240,10 +236,6 @@ async def enhanced_ask(request: EnhancedAskRequest, db=Depends(get_db)):
             conversation_history=request.conversation_history,
             extra=request.extra,
         )
-        # Handle async coroutine if base orchestrator returns one
-        import asyncio
-        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-            result = await result
         if hasattr(result, "to_dict"):
             return result.to_dict()
         return result
@@ -261,14 +253,20 @@ async def list_domains():
     """List all available domain profiles with calibrated thresholds."""
     try:
         mgr = _get_domain_manager()
-        domains = mgr.list_domains()
+        domains = mgr.list_domains()  # Returns List[Dict] with key, name, description
         result = {}
         for d in domains:
-            profile = mgr.detect({}, user_domain=d)
-            result[d] = {
-                "description": profile.description,
-                "thresholds": profile.thresholds.to_dict(),
+            key = d.get("key", "unknown")
+            result[key] = {
+                "name": d.get("name", key),
+                "description": d.get("description", ""),
             }
+            # Try to get thresholds for this domain
+            try:
+                profile = mgr.detect({}, user_domain=key)
+                result[key]["thresholds"] = profile.thresholds.to_dict()
+            except Exception:
+                pass
         return {"domains": result, "count": len(result)}
     except Exception as e:
         return {"error": str(e)}
@@ -279,18 +277,20 @@ async def detect_domain(request: DetectDomainRequest):
     """Auto-detect industry domain from column names."""
     try:
         mgr = _get_domain_manager()
+        # Build dtypes dict with ALL column names as keys
+        dtypes = {}
+        for c in request.column_names:
+            dtypes[c] = (request.column_types or {}).get(c, "unknown")
         ctx = {
-            "dataset_profile": {
-                "dtypes": request.column_types or {c: "unknown" for c in request.column_names},
-                "column_names": request.column_names,
-            },
+            "dataset_profile": {"dtypes": dtypes},
             "feature_stats": {"numeric_stats": {}},
         }
         profile = mgr.detect(ctx)
         return {
             "domain": profile.domain,
-            "confidence": profile.detection_confidence,
-            "description": profile.description,
+            "confidence": round(profile.detection_confidence, 3),
+            "domain_name": profile.domain_name,
+            "evidence": profile.detection_evidence,
             "thresholds": profile.thresholds.to_dict(),
         }
     except Exception as e:
@@ -345,14 +345,7 @@ async def run_statistical_test(request: StatTestRequest):
                 request.skewness or 0, request.kurtosis or 3,
                 request.n_samples or 100,
             )
-            return {
-                "is_normal": r.is_normal,
-                "tests": [
-                    {"test": tr.test_name, "statistic": tr.statistic, "p_value": tr.p_value, "significant": tr.is_significant}
-                    for tr in r.individual_tests
-                ] if hasattr(r, "individual_tests") else [],
-                "suggested_transform": r.suggested_transform,
-            }
+            return r.to_dict()
         elif t == "bootstrap_ci":
             return eng.bootstrap_metric_ci(request.metric_value, request.n_samples or 100, request.metric_name)
         elif t == "model_comparison":
@@ -366,8 +359,9 @@ async def run_statistical_test(request: StatTestRequest):
             "p_value": round(r.p_value, 6) if r.p_value is not None else None,
             "is_significant": r.is_significant,
             "interpretation": r.interpretation,
-            "severity": r.severity,
-            "thresholds": r.thresholds,
+            "method": r.method,
+            "effect_size": r.effect_size,
+            "details": r.details,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -383,7 +377,6 @@ async def run_drift_suite(request: DriftSuiteRequest):
             ref_stats=request.ref_stats, cur_stats=request.cur_stats,
             ref_histogram=request.ref_histogram, cur_histogram=request.cur_histogram,
             ref_percentiles=request.ref_percentiles, cur_percentiles=request.cur_percentiles,
-            ref_distribution=request.ref_distribution, cur_distribution=request.cur_distribution,
         )
         return suite.to_dict()
     except Exception as e:
@@ -510,7 +503,7 @@ async def enhanced_health():
     try:
         from app.core.agent.rule_engine import RuleEngine
         re = RuleEngine()
-        components["rule_engine"] = {"status": "active", "rules": len(re._rules)}
+        components["rule_engine"] = {"status": "active"}
     except Exception as e:
         components["rule_engine"] = {"status": "error", "detail": str(e)}
 
