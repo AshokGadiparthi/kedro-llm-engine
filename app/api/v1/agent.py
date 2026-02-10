@@ -67,6 +67,7 @@ class InsightRequest(BaseModel):
     model_id: Optional[str] = None
     user_id: Optional[str] = Field(default="anonymous", description="User ID for memory/personalization")
     extra: Optional[Dict[str, Any]] = Field(default=None, description="Frontend state (metrics, selections, config)")
+    use_llm: Optional[str] = Field(default="auto", description="LLM usage: 'auto' (smart gating, saves cost), 'always' (force LLM), 'never' (rules only)")
 
 
 class AskRequest(BaseModel):
@@ -80,6 +81,7 @@ class AskRequest(BaseModel):
     conversation_history: Optional[List[Dict[str, str]]] = Field(
         default=None, description="Previous Q&A pairs for multi-turn context"
     )
+    use_llm: Optional[str] = Field(default="auto", description="LLM usage: 'auto' (smart gating), 'always', 'never' (rules only, saves cost)")
 
 
 class ValidateRequest(BaseModel):
@@ -189,6 +191,7 @@ async def get_insights(request: InsightRequest, db=Depends(get_db)):
             model_id=request.model_id,
             user_id=request.user_id,
             extra=request.extra,
+            use_llm=request.use_llm or "auto",
         )
         return InsightResponse(**bundle.to_dict())
 
@@ -220,6 +223,7 @@ async def ask_expert(request: AskRequest, db=Depends(get_db)):
             user_id=request.user_id,
             extra=request.extra,
             conversation_history=request.conversation_history,
+            use_llm=request.use_llm or "auto",
         )
         return AskResponse(**bundle.to_dict())
 
@@ -308,9 +312,9 @@ async def submit_feedback(request: FeedbackRequest, db=Depends(get_db)):
 
 @router.get("/readiness")
 async def get_data_readiness(
-    dataset_id: str = Query(..., description="Dataset ID"),
-    project_id: Optional[str] = Query(None),
-    db=Depends(get_db),
+        dataset_id: str = Query(..., description="Dataset ID"),
+        project_id: Optional[str] = Query(None),
+        db=Depends(get_db),
 ):
     """
     Get comprehensive data readiness assessment.

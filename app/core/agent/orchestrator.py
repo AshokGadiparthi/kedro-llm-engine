@@ -217,13 +217,14 @@ class AgentOrchestrator:
     # ──────────────────────────────────────────────────────────
 
     async def get_insights(
-        self,
-        screen: str,
-        project_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-        model_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        extra: Optional[Dict] = None,
+            self,
+            screen: str,
+            project_id: Optional[str] = None,
+            dataset_id: Optional[str] = None,
+            model_id: Optional[str] = None,
+            user_id: Optional[str] = None,
+            extra: Optional[Dict] = None,
+            use_llm: str = "auto",
     ) -> InsightBundle:
         """
         Full insight pipeline:
@@ -296,17 +297,32 @@ class AgentOrchestrator:
                 bundle.business_impact = self._compute_business_impact(context, extra)
             timings["business_impact"] = round(time.time() - t0, 3)
 
-            # ── Stage 7: LLM Synthesis (optional, non-blocking) ──
+            # ── Stage 7: LLM Synthesis (smart gating — saves API cost) ──
             t0 = time.time()
-            try:
-                llm_result = await self.llm_reasoner.reason(
-                    context, bundle.insights[:10]
-                )
-                bundle.advice = llm_result.advice if hasattr(llm_result, 'advice') else (llm_result.get("advice") if isinstance(llm_result, dict) else None)
-                bundle.source = getattr(llm_result, 'source', 'rules_only') if not isinstance(llm_result, dict) else llm_result.get("source", "rules_only")
-            except Exception as e:
-                logger.warning(f"LLM reasoning failed (non-critical): {e}")
+            should_call_llm = self._should_call_llm(
+                use_llm=use_llm,
+                critical_count=bundle.critical_count,
+                warning_count=bundle.warning_count,
+                total_insights=len(raw_insights),
+                screen=screen,
+            )
+
+            if should_call_llm:
+                try:
+                    llm_result = await self.llm_reasoner.reason(
+                        context, bundle.insights[:10]
+                    )
+                    bundle.advice = llm_result.advice if hasattr(llm_result, 'advice') else (llm_result.get("advice") if isinstance(llm_result, dict) else None)
+                    bundle.source = getattr(llm_result, 'source', 'rules_only') if not isinstance(llm_result, dict) else llm_result.get("source", "rules_only")
+                except Exception as e:
+                    logger.warning(f"LLM reasoning failed (non-critical): {e}")
+                    bundle.advice = self._generate_rules_synthesis(raw_insights, context)
+                    bundle.source = "rules_only"
+            else:
+                bundle.advice = self._generate_rules_synthesis(raw_insights, context)
                 bundle.source = "rules_only"
+                logger.info(f"LLM skipped (use_llm={use_llm}, critical={bundle.critical_count}, "
+                            f"warnings={bundle.warning_count}) — saved ~$0.02")
             timings["llm_reasoning"] = round(time.time() - t0, 3)
 
             # ── Build context summary ──
@@ -324,15 +340,16 @@ class AgentOrchestrator:
     # ──────────────────────────────────────────────────────────
 
     async def ask(
-        self,
-        screen: str,
-        question: str,
-        project_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-        model_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        extra: Optional[Dict] = None,
-        conversation_history: Optional[List[Dict]] = None,
+            self,
+            screen: str,
+            question: str,
+            project_id: Optional[str] = None,
+            dataset_id: Optional[str] = None,
+            model_id: Optional[str] = None,
+            user_id: Optional[str] = None,
+            extra: Optional[Dict] = None,
+            conversation_history: Optional[List[Dict]] = None,
+            use_llm: str = "auto",
     ) -> AskBundle:
         """
         Question answering pipeline:
@@ -379,9 +396,13 @@ class AgentOrchestrator:
             bundle.source = "qa_engine"
             timings["qa_engine"] = round(time.time() - t0, 3)
 
-            # ── Stage 5: LLM Enhancement (if available and useful) ──
+            # ── Stage 5: LLM Enhancement (smart gating — saves cost) ──
             t0 = time.time()
-            if self.llm_reasoner.enabled and qa_result["confidence"] < 0.7:
+            should_use = self._should_call_llm_for_ask(
+                use_llm=use_llm,
+                qa_confidence=qa_result["confidence"],
+            )
+            if should_use:
                 try:
                     llm_result = await self.llm_reasoner.reason(
                         context,
@@ -395,6 +416,8 @@ class AgentOrchestrator:
                         bundle.source = f"llm_enhanced:{src}"
                 except Exception as e:
                     logger.warning(f"LLM enhancement failed: {e}")
+            else:
+                logger.info(f"LLM skipped for /ask (use_llm={use_llm}, confidence={qa_result['confidence']:.2f}) — saved ~$0.01")
             timings["llm_enhancement"] = round(time.time() - t0, 3)
 
             # ── Stage 6: Related Recommendations ──
@@ -429,13 +452,13 @@ class AgentOrchestrator:
     # ──────────────────────────────────────────────────────────
 
     async def validate(
-        self,
-        action: str,
-        screen: str,
-        project_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-        model_id: Optional[str] = None,
-        extra: Optional[Dict] = None,
+            self,
+            action: str,
+            screen: str,
+            project_id: Optional[str] = None,
+            dataset_id: Optional[str] = None,
+            model_id: Optional[str] = None,
+            extra: Optional[Dict] = None,
     ) -> ValidateBundle:
         """
         Validation pipeline:
@@ -503,12 +526,12 @@ class AgentOrchestrator:
     # ──────────────────────────────────────────────────────────
 
     async def get_recommendations(
-        self,
-        screen: str,
-        project_id: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-        model_id: Optional[str] = None,
-        extra: Optional[Dict] = None,
+            self,
+            screen: str,
+            project_id: Optional[str] = None,
+            dataset_id: Optional[str] = None,
+            model_id: Optional[str] = None,
+            extra: Optional[Dict] = None,
     ) -> Dict[str, Any]:
         """
         Full recommendation pipeline:
@@ -549,9 +572,9 @@ class AgentOrchestrator:
     # ──────────────────────────────────────────────────────────
 
     async def get_data_readiness(
-        self,
-        dataset_id: str,
-        project_id: Optional[str] = None,
+            self,
+            dataset_id: str,
+            project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive data readiness assessment.
@@ -610,7 +633,7 @@ class AgentOrchestrator:
         return patterns
 
     def _apply_memory_adjustments(
-        self, insights: List[Insight], user_id: str, bundle: InsightBundle
+            self, insights: List[Insight], user_id: str, bundle: InsightBundle
     ) -> List[Insight]:
         """Adjust insight priority based on user's past feedback."""
         if not self.memory:
@@ -658,7 +681,7 @@ class AgentOrchestrator:
             return insights
 
     def _get_screen_recommendations(
-        self, screen: str, context: Dict, analysis: Dict
+            self, screen: str, context: Dict, analysis: Dict
     ) -> Dict:
         """Get screen-appropriate recommendations."""
         try:
@@ -693,7 +716,7 @@ class AgentOrchestrator:
             return {}
 
     def _get_question_recommendations(
-        self, question: str, screen: str, context: Dict, analysis: Dict
+            self, question: str, screen: str, context: Dict, analysis: Dict
     ) -> Dict:
         """Extract recommendations relevant to a user's question."""
         q_lower = question.lower()
@@ -804,6 +827,143 @@ class AgentOrchestrator:
             "last_phase": pipeline.get("last_phase"),
             "next_phase": pipeline.get("next_recommended_phase"),
         }
+
+    # ──────────────────────────────────────────────────────────
+    # LLM SMART GATING (cost optimization)
+    # ──────────────────────────────────────────────────────────
+
+    def _should_call_llm(
+            self,
+            use_llm: str,
+            critical_count: int,
+            warning_count: int,
+            total_insights: int,
+            screen: str,
+    ) -> bool:
+        """
+        Smart gating for /insights — decides if LLM is worth the cost.
+
+        use_llm modes:
+          'never'  → Always skip LLM (rules only, $0)
+          'always' → Always call LLM (~$0.02 per call)
+          'auto'   → Smart: only call when rules need synthesis
+
+        Auto logic:
+          - Call LLM when 4+ critical issues (complex, needs prioritized synthesis)
+          - Call LLM when 15+ total insights (too many for user to parse alone)
+          - Call LLM for evaluation/deployment screens (high-stakes decisions)
+          - Skip for simple datasets where rules give clear actionable answers
+        """
+        if not self.llm_reasoner.enabled:
+            return False
+
+        if use_llm == "never":
+            return False
+        if use_llm == "always":
+            return True
+
+        # Auto mode — smart gating
+        # High-stakes screens always get LLM synthesis
+        if screen in ("evaluation", "deployment", "monitoring"):
+            return True
+
+        # Complex situation — many critical issues need prioritized expert guidance
+        if critical_count >= 4:
+            return True
+
+        # Information overload — too many findings for user to parse alone
+        if total_insights >= 15:
+            return True
+
+        # Mixed severity with substantial warnings — needs nuanced advice
+        if critical_count >= 2 and warning_count >= 5:
+            return True
+
+        # Simple situation — rules are clear enough
+        return False
+
+    def _should_call_llm_for_ask(
+            self,
+            use_llm: str,
+            qa_confidence: float,
+    ) -> bool:
+        """
+        Smart gating for /ask — decides if LLM should enhance the QA answer.
+
+        Auto logic:
+          - Call LLM only when QA engine confidence < 0.7
+          - This means the deterministic engine couldn't find a confident match
+        """
+        if not self.llm_reasoner.enabled:
+            return False
+
+        if use_llm == "never":
+            return False
+        if use_llm == "always":
+            return True
+
+        # Auto mode — only enhance low-confidence answers
+        return qa_confidence < 0.7
+
+    def _generate_rules_synthesis(
+            self,
+            insights: List,
+            context: Dict,
+    ) -> str:
+        """
+        Generate a structured summary from rules alone (no LLM cost).
+        Provides actionable advice by organizing insights by priority.
+        """
+        profile = context.get("dataset_profile", {})
+        rows = profile.get("rows", 0)
+        cols = profile.get("columns", 0)
+
+        criticals = [i for i in insights if i.severity == "critical"]
+        warnings = [i for i in insights if i.severity == "warning"]
+        tips = [i for i in insights if i.severity in ("tip", "info")]
+        successes = [i for i in insights if i.severity == "success"]
+
+        parts = []
+
+        # Header
+        if rows > 0:
+            parts.append(f"**Dataset: {rows:,} rows × {cols} columns**\n")
+
+        # Critical issues
+        if criticals:
+            parts.append(f"## 🔴 {len(criticals)} Critical Issue(s) — Fix Before Training\n")
+            for i, c in enumerate(criticals[:5], 1):
+                parts.append(f"{i}. **{c.title}**")
+                if c.action:
+                    parts.append(f"   → {c.action}\n")
+                else:
+                    parts.append("")
+
+        # Warnings
+        if warnings:
+            parts.append(f"\n## ⚠️ {len(warnings)} Warning(s)\n")
+            for w in warnings[:5]:
+                parts.append(f"- **{w.title}**: {w.message[:120]}{'...' if len(w.message) > 120 else ''}")
+
+        # Positive findings
+        if successes:
+            parts.append(f"\n## ✅ What's Good\n")
+            for s in successes[:3]:
+                parts.append(f"- {s.title}")
+
+        # Tips
+        if tips:
+            parts.append(f"\n## 💡 Suggestions\n")
+            for t in tips[:3]:
+                parts.append(f"- **{t.title}**: {t.action or t.message[:100]}")
+
+        if not parts:
+            parts.append("No significant issues detected. Dataset appears ready for modeling.")
+
+        parts.append(f"\n\n*Analysis: {len(criticals)} critical, {len(warnings)} warnings, "
+                     f"{len(tips)} tips | Source: rules_only (LLM not used, $0 cost)*")
+
+        return "\n".join(parts)
 
     # ──────────────────────────────────────────────────────────
     # FEEDBACK & MEMORY
