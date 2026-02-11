@@ -307,7 +307,12 @@ class ExtendedRulesMixin:
             ))
 
         # FE-005: Target encoding for high-cardinality categoricals
-        high_card = features.get("high_cardinality_categoricals", [])
+        # Exclude columns already flagged as IDs — DL-001 says to drop those
+        id_col_names = {c.get("column", "") for c in features.get("potential_id_columns", [])}
+        high_card = [
+            c for c in features.get("high_cardinality_categoricals", [])
+            if c.get("column", "") not in id_col_names
+        ]
         if high_card:
             out.append(Insight(
                 severity="tip", category="Feature Engineering",
@@ -513,6 +518,7 @@ class ExtendedRulesMixin:
 
     def _rules_data_leakage_extended(self, ctx: Dict, out: List[Insight]):
         profile = ctx.get("dataset_profile", {})
+        features = ctx.get("feature_stats", {})
         col_types = profile.get("column_types", {})
         col_names = profile.get("column_names", [])
         correlations = ctx.get("correlations", {})
@@ -564,8 +570,15 @@ class ExtendedRulesMixin:
             ))
 
         # DL-005: Group leakage risk
+        # Only fire if the column could actually be a GROUP (same entity appears multiple times)
+        # If it's 100% unique (like customerID), it's an ID column — no grouping possible
         id_keywords = ["customer", "user", "patient", "account", "group", "household"]
-        group_cols = [c for c in col_names if any(k in c.lower() for k in id_keywords)]
+        id_col_names = {c.get("column", "") for c in features.get("potential_id_columns", [])}
+        group_cols = [
+            c for c in col_names
+            if any(k in c.lower() for k in id_keywords)
+               and c not in id_col_names  # Exclude 100% unique IDs — they can't be group keys
+        ]
         if group_cols:
             out.append(Insight(
                 severity="info", category="Data Leakage",

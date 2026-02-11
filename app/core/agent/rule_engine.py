@@ -742,7 +742,7 @@ class RuleEngine(_get_extended_mixin()):
                 if isinstance(cs, dict):
                     unique = cs.get("unique", 0)
                     top_freq = cs.get("top_freq", 0)
-                    top_value = cs.get("top", "")
+                    top_value = cs.get("top_value", cs.get("top", ""))  # compiler stores "top_value"
 
                     if unique == 2 and rows > 0 and top_freq > 0:
                         # Binary categorical: compute imbalance from top_freq

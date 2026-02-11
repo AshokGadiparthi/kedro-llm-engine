@@ -60,6 +60,22 @@ class PatternDetector:
 
     def detect_all(self, context: Dict[str, Any]) -> List[DetectedPattern]:
         """Run all pattern detectors and return findings."""
+        # Bridge target_variable → screen_context (same fix as rule_engine)
+        target_info = context.get("target_variable", {})
+        if isinstance(target_info, dict) and target_info.get("name"):
+            sc = context.get("screen_context")
+            if sc is None:
+                sc = {}
+                context["screen_context"] = sc
+            if not sc.get("target_column"):
+                sc["target_column"] = target_info["name"]
+            fs = context.get("frontend_state")
+            if fs is None:
+                fs = {}
+                context["frontend_state"] = fs
+            if not fs.get("target_column"):
+                fs["target_column"] = target_info["name"]
+
         patterns = []
         patterns.extend(self._detect_leakage_signals(context))
         patterns.extend(self._detect_confounding_signs(context))
@@ -83,7 +99,7 @@ class PatternDetector:
     def _detect_leakage_signals(self, ctx: Dict) -> List[DetectedPattern]:
         """
         Detect features that may leak the target variable.
-        
+
         Signals:
         - Perfect or near-perfect correlation with target
         - Feature names suggesting post-hoc derivation
@@ -94,7 +110,7 @@ class PatternDetector:
         high_pairs = correlations.get("high_pairs", [])
         feature_stats = ctx.get("feature_stats", {})
         profile = ctx.get("dataset_profile", {})
-        
+
         screen_ctx = ctx.get("screen_context", {}) or {}
         frontend = ctx.get("frontend_state", {}) or {}
         target = screen_ctx.get("target_column") or frontend.get("target_column")
@@ -149,15 +165,22 @@ class PatternDetector:
                 ))
 
         # Check for post-hoc feature names
+        # Note: "billing" and "payment" removed — too generic, causes false positives
+        # on legitimate features like PaperlessBilling, PaymentMethod
         posthoc_patterns = [
-            "result", "outcome", "status", "final", "total_charge",
-            "billing", "payment", "settled", "resolved", "closed",
+            "result", "outcome", "final", "total_charge",
+            "settled", "resolved", "closed", "cancelled", "cancellation",
+            "end_date", "close_date", "resolution", "disposition",
         ]
+        # Exclusion: if column name contains these, it's likely a feature, not post-hoc
+        posthoc_exclude = ["method", "type", "plan", "option", "preference", "category"]
         column_names = profile.get("column_names", [])
         posthoc_suspects = []
         for col in column_names:
             col_lower = col.lower()
             if col == target:
+                continue
+            if any(ex in col_lower for ex in posthoc_exclude):
                 continue
             for pattern in posthoc_patterns:
                 if pattern in col_lower:
@@ -192,7 +215,7 @@ class PatternDetector:
     def _detect_confounding_signs(self, ctx: Dict) -> List[DetectedPattern]:
         """
         Detect potential confounding variables.
-        
+
         A confounding variable drives both the predictor and the outcome,
         creating a spurious correlation. We detect this via:
         - Two features highly correlated with each other AND both correlated with target
@@ -201,7 +224,7 @@ class PatternDetector:
         patterns = []
         correlations = ctx.get("correlations", {})
         high_pairs = correlations.get("high_pairs", [])
-        
+
         screen_ctx = ctx.get("screen_context", {}) or {}
         frontend = ctx.get("frontend_state", {}) or {}
         target = screen_ctx.get("target_column") or frontend.get("target_column")
@@ -485,7 +508,7 @@ class PatternDetector:
     def _detect_label_noise_signals(self, ctx: Dict) -> List[DetectedPattern]:
         """
         Detect signals that suggest labeling errors in the target.
-        
+
         Indicators:
         - Very low F1 despite good features (high correlation features exist)
         - High AUC but low accuracy (model separates but labels are noisy)
@@ -631,7 +654,7 @@ class PatternDetector:
     def _detect_train_test_contamination(self, ctx: Dict) -> List[DetectedPattern]:
         """
         Detect signs that train and test data are contaminated.
-        
+
         Signals:
         - Test score higher than train score (impossible without contamination)
         - Test and train scores nearly identical on non-trivial problem

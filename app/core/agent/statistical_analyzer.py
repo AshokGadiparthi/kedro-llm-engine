@@ -702,13 +702,40 @@ class StatisticalAnalyzer:
                             target_score = 75
 
             elif target in cat_stats:
-                # Categorical target — check unique count
+                # Categorical target — check unique count AND actual imbalance
                 cs = cat_stats[target]
                 if isinstance(cs, dict):
                     unique = cs.get("unique", 0)
+                    top_freq = cs.get("top_freq", 0)
+                    top_value = cs.get("top_value", cs.get("top", ""))
                     if unique == 2:
-                        target_score = 80
-                        report.strengths.append(f"Binary target detected: '{target}'")
+                        # Binary categorical — compute actual imbalance
+                        if top_freq > 0 and rows > 0:
+                            majority_pct = (top_freq / rows) * 100
+                            minority_pct = 100 - majority_pct
+                            if minority_pct < 5:
+                                target_score = 35
+                                report.bottlenecks.append(
+                                    f"Severe class imbalance in '{target}': "
+                                    f"'{top_value}'={majority_pct:.1f}%, minority={minority_pct:.1f}%"
+                                )
+                            elif minority_pct < 20:
+                                target_score = 60
+                                report.bottlenecks.append(
+                                    f"Moderate class imbalance in '{target}': "
+                                    f"minority={minority_pct:.1f}% — use class_weight='balanced'"
+                                )
+                            elif minority_pct < 35:
+                                target_score = 72
+                                report.strengths.append(
+                                    f"Binary target '{target}' with {minority_pct:.1f}% minority — acceptable balance"
+                                )
+                            else:
+                                target_score = 90
+                                report.strengths.append(f"Well-balanced binary target: '{target}'")
+                        else:
+                            target_score = 75
+                            report.strengths.append(f"Binary target detected: '{target}'")
                     elif unique <= 10:
                         target_score = 70
                         report.strengths.append(f"Multi-class target detected: '{target}' ({unique} classes)")
