@@ -906,7 +906,7 @@ class ContextCompiler:
         }
 
     async def _enrich_training(self, ctx, extra):
-        return {
+        enriched = {
             "view": "model_training", "algorithm": extra.get("algorithm"),
             "target_column": extra.get("target_column"),
             "selected_features": extra.get("selected_features", []),
@@ -917,6 +917,27 @@ class ContextCompiler:
             "selected_algorithms": extra.get("selected_algorithms", []),
             "stratified": extra.get("stratified", True),
         }
+
+        # ── Post-training enrichment (when model_results are passed) ──
+        if extra.get("training_completed") or extra.get("model_results"):
+            enriched["training_completed"] = True
+            enriched["model_results"] = extra.get("model_results", [])
+            enriched["best_algorithm"] = extra.get("best_algorithm", "")
+            enriched["best_score"] = _sf(extra.get("best_score", 0))
+            enriched["total_models_trained"] = _si(extra.get("total_models_trained", 0))
+            enriched["total_models_failed"] = _si(extra.get("total_models_failed", 0))
+            enriched["execution_time"] = _sf(extra.get("execution_time", 0))
+            enriched["job_id"] = extra.get("job_id", "")
+
+        # ── Model version data (from DB if model_id provided) ──
+        if extra.get("model_metrics"):
+            enriched["metrics"] = extra["model_metrics"]
+        if extra.get("feature_importances"):
+            enriched["feature_importances"] = extra["feature_importances"]
+        if extra.get("confusion_matrix"):
+            enriched["confusion_matrix"] = extra["confusion_matrix"]
+
+        return enriched
 
     async def _enrich_evaluation(self, ctx, extra):
         return {

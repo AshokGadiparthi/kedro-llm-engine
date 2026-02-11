@@ -1171,3 +1171,327 @@ class ExtendedRulesMixin:
                 ),
                 impact="low", tags=["documentation", "model_card"], rule_id="PL-008",
             ))
+
+    # ═══════════════════════════════════════════════════════════
+    # ML FLOW POST-TRAINING RULES (MF-001 → MF-010)
+    # ═══════════════════════════════════════════════════════════
+    #
+    # These rules fire ONLY when model_results[] is present in the
+    # enriched context (i.e., after training completes and the
+    # frontend passes the leaderboard data).
+    #
+    # Data expected in context["screen_context"]:
+    #   training_completed: true
+    #   model_results: [{algorithm, train_score, test_score, ...}, ...]
+    #   best_algorithm: str
+    #   best_score: float
+
+    def _rules_mlflow_post_training(self, ctx: Dict, out: List[Insight]):
+        """Post-training rules that analyze model comparison results."""
+        sc = ctx.get("screen_context") or {}
+        if not sc.get("training_completed"):
+            return  # Only fire after training
+
+        model_results = sc.get("model_results", [])
+        if not model_results:
+            return
+
+        # Parse valid models
+        valid = []
+        failed = []
+        for m in model_results:
+            if m.get("status") == "failed":
+                failed.append(m)
+                continue
+            test = m.get("test_score", m.get("accuracy", m.get("score")))
+            train = m.get("train_score", m.get("training_score"))
+            if test is not None:
+                try:
+                    t = float(test)
+                    if t > 1:
+                        t = t / 100.0
+                    tr = float(train) if train is not None else None
+                    if tr is not None and tr > 1:
+                        tr = tr / 100.0
+                    valid.append({
+                        "algorithm": m.get("algorithm", "Unknown"),
+                        "test_score": t,
+                        "train_score": tr,
+                        "gap": abs(tr - t) if tr is not None else None,
+                    })
+                except (ValueError, TypeError):
+                    pass
+
+        if not valid:
+            return
+
+        valid.sort(key=lambda x: x["test_score"], reverse=True)
+        winner = valid[0]
+        total_trained = len(valid)
+
+        # ── MF-001: Winner Summary ──────────────────────────
+        runner_up = valid[1] if len(valid) > 1 else None
+        margin = (winner["test_score"] - runner_up["test_score"]) if runner_up else 0
+        margin_str = f"{margin * 100:.2f}%"
+
+        margin_context = ""
+        if margin < 0.005:
+            margin_context = "virtually tied with runner-up — choose based on simplicity"
+        elif margin < 0.02:
+            margin_context = f"narrow edge ({margin_str}) over {runner_up['algorithm']}"
+        else:
+            margin_context = f"clear lead ({margin_str}) over {runner_up['algorithm']}"
+
+        # Build generalization info for message
+        gap_info = ""
+        if winner.get("gap") is not None:
+            gap_pct = f"{winner['gap']*100:.2f}%"
+            gap_lbl = self._gap_label(winner["gap"])
+            gap_info = f" Generalization gap: {gap_pct} ({gap_lbl})."
+
+        out.append(Insight(
+            severity="info", category="Model Comparison",
+            title=f"🏆 {winner['algorithm']} Wins — {winner['test_score']*100:.2f}% Accuracy",
+            message=(
+                f"Out of {total_trained} algorithms tested, {winner['algorithm']} achieved the best "
+                f"test accuracy of {winner['test_score']*100:.2f}% — {margin_context}.{gap_info}"
+            ),
+            action=self._mf001_action(winner["test_score"]),
+            evidence=f"Winner: {winner['algorithm']} ({winner['test_score']*100:.2f}%), {total_trained} models compared",
+            impact="high", tags=["model_selection", "winner"], rule_id="MF-001",
+        ))
+
+        # ── MF-002: Overfitting Detection (Winner) ──────────
+        if winner.get("gap") is not None and winner["gap"] >= 0.05:
+            out.append(Insight(
+                severity="warning", category="Model Comparison",
+                title=f"⚠️ {winner['algorithm']} Shows Overfitting ({winner['gap']*100:.1f}% gap)",
+                message=(
+                    f"The best model has a {winner['gap']*100:.1f}% gap between training "
+                    f"({winner['train_score']*100:.1f}%) and test ({winner['test_score']*100:.1f}%) "
+                    f"accuracy. This means it memorizes training patterns that don't generalize."
+                ),
+                action=(
+                    "To reduce overfitting: (1) Add regularization. (2) Reduce model complexity "
+                    "(fewer trees, lower max_depth). (3) Get more training data. "
+                    "(4) Consider the 2nd-best model if it generalizes better."
+                ),
+                evidence=f"Train: {winner['train_score']*100:.1f}%, Test: {winner['test_score']*100:.1f}%",
+                impact="high", tags=["overfitting", "generalization"], rule_id="MF-002",
+            ))
+
+        # ── MF-003: All Models Underperforming ──────────────
+        if winner["test_score"] < 0.65:
+            out.append(Insight(
+                severity="critical", category="Model Comparison",
+                title=f"All Models Underperforming (Best: {winner['test_score']*100:.1f}%)",
+                message=(
+                    f"None of the {total_trained} algorithms achieved above 65% accuracy. "
+                    "This typically indicates: (1) Insufficient signal in features, "
+                    "(2) Wrong target column, (3) Data quality issues, or "
+                    "(4) The problem requires different features entirely."
+                ),
+                action=(
+                    "Go back to EDA: Check feature-target correlations, look for data leakage, "
+                    "consider feature engineering, or verify the target column is correct."
+                ),
+                evidence=f"Best: {winner['test_score']*100:.1f}%, Worst: {valid[-1]['test_score']*100:.1f}%",
+                impact="high", tags=["underfitting", "performance"], rule_id="MF-003",
+            ))
+
+        # ── MF-004: Tight Performance Spread ────────────────
+        if len(valid) >= 3:
+            top3_spread = valid[0]["test_score"] - valid[2]["test_score"]
+            if top3_spread < 0.01:
+                out.append(Insight(
+                    severity="info", category="Model Comparison",
+                    title=f"Top 3 Models Within {top3_spread*100:.2f}% — Choose by Simplicity",
+                    message=(
+                        f"The top 3 algorithms ({valid[0]['algorithm']}, {valid[1]['algorithm']}, "
+                        f"{valid[2]['algorithm']}) are within {top3_spread*100:.2f}% of each other. "
+                        "This difference is NOT statistically significant."
+                    ),
+                    action=(
+                        "When accuracy is tied, choose based on: (1) Interpretability — can you explain predictions? "
+                        "(2) Speed — training and inference time. (3) Deployment complexity — simpler models are easier to maintain."
+                    ),
+                    evidence=f"Top 3 spread: {top3_spread*100:.2f}%",
+                    impact="medium", tags=["model_selection", "statistical_significance"], rule_id="MF-004",
+                ))
+
+        # ── MF-005: Failed Algorithms ───────────────────────
+        if failed:
+            fail_names = [f.get("algorithm", "unknown") for f in failed]
+            nb_models = {"MultinomialNB", "ComplementNB", "CategoricalNB", "GaussianNB", "BernoulliNB"}
+            nb_fails = [n for n in fail_names if n in nb_models]
+            other_fails = [n for n in fail_names if n not in nb_models]
+
+            if nb_fails and not other_fails:
+                out.append(Insight(
+                    severity="info", category="Model Comparison",
+                    title=f"{len(nb_fails)} Naive Bayes Model(s) Failed — Expected with Standard Scaling",
+                    message=(
+                        f"{', '.join(nb_fails)} failed because they require non-negative input, "
+                        "but StandardScaler produces negative values. This is a known incompatibility, "
+                        "not a data problem."
+                    ),
+                    action="No action needed — these algorithms are incompatible with the current preprocessing.",
+                    evidence=f"Failed: {', '.join(nb_fails)}",
+                    impact="low", tags=["algorithm_failure", "preprocessing"], rule_id="MF-005",
+                ))
+            elif other_fails:
+                out.append(Insight(
+                    severity="warning", category="Model Comparison",
+                    title=f"{len(other_fails)} Algorithm(s) Failed Unexpectedly",
+                    message=f"Failed: {', '.join(other_fails)}. Check backend logs for error details.",
+                    action="Review the error messages in Backend Logs to identify the root cause.",
+                    evidence=f"Failed: {', '.join(other_fails)}",
+                    impact="medium", tags=["algorithm_failure"], rule_id="MF-005",
+                ))
+
+        # ── MF-006: Linear Model Competitive ────────────────
+        linear_names = {"LogisticRegression", "RidgeClassifier", "SGDClassifier",
+                        "PassiveAggressiveClassifier", "Perceptron", "LinearSVC"}
+        complex_names = {"GradientBoostingClassifier", "RandomForestClassifier",
+                         "ExtraTreesClassifier", "AdaBoostClassifier", "BaggingClassifier",
+                         "XGBClassifier", "LGBMClassifier", "CatBoostClassifier"}
+
+        best_linear = None
+        best_complex = None
+        for m in valid:
+            if m["algorithm"] in linear_names and best_linear is None:
+                best_linear = m
+            if m["algorithm"] in complex_names and best_complex is None:
+                best_complex = m
+
+        if best_linear and best_complex:
+            lin_gap = best_complex["test_score"] - best_linear["test_score"]
+            if lin_gap < 0.015:  # Within 1.5%
+                out.append(Insight(
+                    severity="info", category="Model Comparison",
+                    title=f"💡 {best_linear['algorithm']} Matches Complex Models — Consider Deploying It",
+                    message=(
+                        f"{best_linear['algorithm']} ({best_linear['test_score']*100:.2f}%) is within "
+                        f"{lin_gap*100:.2f}% of {best_complex['algorithm']} ({best_complex['test_score']*100:.2f}%). "
+                        "Linear models are faster, more interpretable, and more stable in production."
+                    ),
+                    action=(
+                        "For production: linear models have faster inference (<1ms vs 5-50ms for trees), "
+                        "require less memory, and are easier to debug when predictions go wrong."
+                    ),
+                    evidence=f"Linear: {best_linear['test_score']*100:.2f}%, Complex: {best_complex['test_score']*100:.2f}%",
+                    impact="medium", tags=["model_selection", "interpretability"], rule_id="MF-006",
+                ))
+
+        # ── MF-007: Ensemble vs Best Single Model ───────────
+        ensemble_algos = {"VotingEnsemble", "VotingClassifier", "StackingClassifier"}
+        best_ensemble = None
+        best_single = None
+        for m in valid:
+            if m["algorithm"] in ensemble_algos and best_ensemble is None:
+                best_ensemble = m
+            elif m["algorithm"] not in ensemble_algos and best_single is None:
+                best_single = m
+
+        if best_ensemble and best_single:
+            if best_ensemble["test_score"] < best_single["test_score"]:
+                out.append(Insight(
+                    severity="info", category="Model Comparison",
+                    title="Ensemble Did Not Outperform Best Single Model",
+                    message=(
+                        f"VotingEnsemble ({best_ensemble['test_score']*100:.2f}%) scored below "
+                        f"{best_single['algorithm']} ({best_single['test_score']*100:.2f}%). "
+                        "This happens when top models are too similar or one model dominates."
+                    ),
+                    action=(
+                        "For better ensembles: (1) Combine diverse model types (linear + tree + SVM). "
+                        "(2) Try stacking instead of voting. (3) Use weighted voting based on individual performance."
+                    ),
+                    evidence=f"Ensemble: {best_ensemble['test_score']*100:.2f}%, Best single: {best_single['test_score']*100:.2f}%",
+                    impact="low", tags=["ensemble", "model_selection"], rule_id="MF-007",
+                ))
+
+        # ── MF-008: Tree Models Overfitting More ────────────
+        tree_gaps = [m["gap"] for m in valid if m["algorithm"] in complex_names and m.get("gap") is not None]
+        linear_gaps = [m["gap"] for m in valid if m["algorithm"] in linear_names and m.get("gap") is not None]
+
+        if tree_gaps and linear_gaps:
+            avg_tree_gap = sum(tree_gaps) / len(tree_gaps)
+            avg_linear_gap = sum(linear_gaps) / len(linear_gaps)
+            if avg_tree_gap > avg_linear_gap + 0.015:
+                out.append(Insight(
+                    severity="info", category="Model Comparison",
+                    title=f"Tree Models Overfitting More Than Linear ({avg_tree_gap*100:.1f}% vs {avg_linear_gap*100:.1f}%)",
+                    message=(
+                        f"Tree-based models average {avg_tree_gap*100:.1f}% generalization gap vs "
+                        f"{avg_linear_gap*100:.1f}% for linear models. This suggests the dataset may benefit "
+                        "from regularization or simpler models."
+                    ),
+                    action=(
+                        "If using tree models: (1) Reduce max_depth. (2) Increase min_samples_leaf. "
+                        "(3) Add more regularization. (4) Use early stopping."
+                    ),
+                    evidence=f"Tree avg gap: {avg_tree_gap*100:.1f}%, Linear avg gap: {avg_linear_gap*100:.1f}%",
+                    impact="medium", tags=["overfitting", "complexity"], rule_id="MF-008",
+                ))
+
+        # ── MF-009: Good Performance — Ready to Deploy ──────
+        if winner["test_score"] >= 0.80 and (winner.get("gap") is None or winner["gap"] < 0.05):
+            out.append(Insight(
+                severity="tip", category="Model Comparison",
+                title=f"✅ {winner['algorithm']} is Production-Ready ({winner['test_score']*100:.1f}%)",
+                message=(
+                    f"With {winner['test_score']*100:.1f}% accuracy and "
+                    f"{'excellent' if (winner.get('gap') or 0) < 0.02 else 'good'} generalization, "
+                    f"this model is ready for deployment. Click 'Deploy Best Model' to proceed."
+                ),
+                action=(
+                    "Before deploying: (1) Review feature importances. (2) Test on holdout data. "
+                    "(3) Set up monitoring for accuracy drift. (4) Document the model."
+                ),
+                evidence=f"Score: {winner['test_score']*100:.1f}%, Gap: {(winner.get('gap') or 0)*100:.1f}%",
+                impact="high", tags=["deployment", "production_ready"], rule_id="MF-009",
+            ))
+
+        # ── MF-010: Statistical Significance Warning ────────
+        if len(valid) >= 2:
+            top_margin = valid[0]["test_score"] - valid[1]["test_score"]
+            if 0.002 < top_margin < 0.01:
+                out.append(Insight(
+                    severity="info", category="Model Comparison",
+                    title=f"Winner's Margin May Not Be Statistically Significant ({top_margin*100:.2f}%)",
+                    message=(
+                        f"The difference between {valid[0]['algorithm']} and {valid[1]['algorithm']} "
+                        f"is only {top_margin*100:.2f}%. On a different random split, the ranking could reverse. "
+                        "Cross-validation would give more reliable comparison."
+                    ),
+                    action=(
+                        "For robust comparison: (1) Run cross-validation (5-10 folds). "
+                        "(2) Use paired t-test on fold scores. (3) If margin < 1%, treat models as equivalent."
+                    ),
+                    evidence=f"Margin: {top_margin*100:.2f}% between top 2",
+                    impact="medium", tags=["statistical_significance", "model_selection"], rule_id="MF-010",
+                ))
+
+    @staticmethod
+    def _gap_label(gap):
+        """Helper for MF rules — generalization gap label."""
+        if gap is None:
+            return "Unknown"
+        if gap < 0.02:
+            return "Excellent"
+        elif gap < 0.05:
+            return "Good"
+        elif gap < 0.10:
+            return "Moderate"
+        return "Poor"
+
+    @staticmethod
+    def _mf001_action(test_score):
+        """Helper for MF-001 — action based on score level."""
+        if test_score >= 0.80:
+            return "Deploy with confidence — strong performance."
+        elif test_score >= 0.70:
+            return "Good baseline — try hyperparameter tuning for improvement."
+        else:
+            return "Consider feature engineering before deploying."

@@ -167,6 +167,8 @@ class RuleEngine(_get_extended_mixin()):
             ]:
                 if hasattr(self, _ext):
                     getattr(self, _ext)(context, insights)
+            if hasattr(self, '_rules_mlflow_post_training'):
+                self._rules_mlflow_post_training(context, insights)
 
         # ── Screen-specific rules ──
         if screen in ("dashboard",):
@@ -184,6 +186,8 @@ class RuleEngine(_get_extended_mixin()):
                 self._rules_training_config_extended(context, insights)
             if hasattr(self, '_rules_algorithm_selection_extended'):
                 self._rules_algorithm_selection_extended(context, insights)
+            if hasattr(self, '_rules_mlflow_post_training'):
+                self._rules_mlflow_post_training(context, insights)
 
         if screen in ("evaluation",):
             self._rules_evaluation_metrics(context, insights)

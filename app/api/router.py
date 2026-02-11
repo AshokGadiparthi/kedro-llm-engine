@@ -3,6 +3,7 @@ API Router — Combines all endpoint groups under /agent.
 
 Original (7 endpoints):     /api/v1/agent/{insights,ask,validate,recommend,feedback,readiness,health}
 Enhanced (16 endpoints):    /api/v1/agent/enhanced/*, /api/v1/agent/feedback/*, /api/v1/agent/cost-matrices/*, etc.
+ML Flow (4 endpoints):      /api/v1/agent/mlflow/{smart-config,compare,explain,head-to-head}
 """
 
 from fastapi import APIRouter
@@ -10,6 +11,7 @@ from fastapi import APIRouter
 from app.api.v1.agent import router as agent_router
 from app.api.v1.enhanced import router as enhanced_router
 from app.api.v1.eda_endpoints import router as eda_router
+from app.api.v1.mlflow_endpoints import router as mlflow_router
 
 api_router = APIRouter()
 
@@ -29,4 +31,10 @@ api_router.include_router(
     eda_router,
     prefix="/agent",
     tags=["ML Expert Agent — EDA Enhancements"],
+)
+
+api_router.include_router(
+    mlflow_router,
+    prefix="/agent",
+    tags=["ML Expert Agent — ML Flow AI"],
 )

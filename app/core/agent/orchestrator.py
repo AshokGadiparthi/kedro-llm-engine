@@ -53,6 +53,7 @@ from .knowledge_base import (
 from .qa_engine import QAEngine
 from .llm_reasoner import LLMReasoner
 from .memory_store import MemoryStore
+from .mlflow_analyzer import MLFlowAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,7 @@ class AgentOrchestrator:
         self.validation_engine = ValidationEngine()
         self.qa_engine = QAEngine()
         self.llm_reasoner = LLMReasoner()
+        self.mlflow_analyzer = MLFlowAnalyzer()
         self.memory = memory_store
 
         # Cache
@@ -306,6 +308,30 @@ class AgentOrchestrator:
                 screen, context, analysis
             )
             timings["recommendations"] = round(time.time() - t0, 3)
+
+            # ── Stage 5.5: ML Flow Post-Training Analysis ──
+            t0 = time.time()
+            if screen in ("mlflow", "training") and extra and (extra.get("training_completed") or extra.get("model_results")):
+                try:
+                    mlflow_analysis = self.mlflow_analyzer.analyze_leaderboard(
+                        model_results=extra.get("model_results", []),
+                        context=context.get("dataset_profile"),
+                    )
+                    # Merge ML Flow analysis into recommendations
+                    bundle.recommendations["mlflow_analysis"] = mlflow_analysis
+                    # Override suggested questions with post-training specific ones
+                    if mlflow_analysis.get("suggested_questions"):
+                        bundle.suggested_questions = mlflow_analysis["suggested_questions"]
+                    # Add training issues to analysis
+                    training_issues = self.mlflow_analyzer.detect_training_issues(
+                        model_results=extra.get("model_results", []),
+                        context=context.get("dataset_profile"),
+                    )
+                    if training_issues:
+                        bundle.recommendations["training_issues"] = training_issues
+                except Exception as e:
+                    logger.warning(f"ML Flow analysis failed (non-critical): {e}")
+            timings["mlflow_analysis"] = round(time.time() - t0, 3)
 
             # ── Stage 6: Business Impact (if evaluation/deployment screen) ──
             t0 = time.time()
@@ -1094,6 +1120,27 @@ class AgentOrchestrator:
             questions.append(
                 "Which algorithm handles my mixed feature types best?"
             )
+
+        # ── ML Flow post-training questions ──
+        mf_rules = [r for r in rule_ids if r.startswith("MF-")]
+        if mf_rules:
+            sc = context.get("screen_context") or {}
+            winner_algo = sc.get("best_algorithm", "the best model")
+            best_score = sc.get("best_score", 0)
+
+            # Override with training-specific questions
+            questions = []
+            questions.append(f"Why did {winner_algo} outperform the other algorithms?")
+            if best_score and best_score < 0.80:
+                questions.append(f"Is {best_score * 100:.0f}% accuracy good enough to deploy?")
+            if "MF-002" in rule_ids:
+                questions.append(f"How can I reduce overfitting in {winner_algo}?")
+            if "MF-006" in rule_ids:
+                questions.append("Should I deploy the simpler linear model instead?")
+            if "MF-004" in rule_ids:
+                questions.append("Top models are tied — which should I choose?")
+            questions.append("What should I try next to improve performance?")
+            questions.append("Which model is best for production deployment?")
 
         # Trim to 5 and ensure no duplicates
         seen = set()
