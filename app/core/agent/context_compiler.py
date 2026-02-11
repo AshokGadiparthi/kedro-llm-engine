@@ -149,6 +149,7 @@ class ContextCompiler:
             "dashboard": self._enrich_dashboard,
             "data": self._enrich_data,
             "eda": self._enrich_eda,
+            "feature_engineering": self._enrich_feature_engineering,
             "mlflow": self._enrich_training,
             "training": self._enrich_training,
             "evaluation": self._enrich_evaluation,
@@ -904,6 +905,70 @@ class ContextCompiler:
             "problem_type": extra.get("problem_type",
                                       "classification" if target_type in ("binary", "multiclass") else None),
         }
+
+    async def _enrich_feature_engineering(self, ctx, extra):
+        """Enrich feature engineering screen with full pipeline context.
+
+        Data Sources (priority order):
+          1. Frontend extra fields (direct pipeline results)
+          2. Parsed Kedro logs (if pipeline_log provided)
+          3. DB enrichment (EDA, model versions, job history)
+        """
+        enriched = {
+            "view": "feature_engineering",
+            "scaling_method": extra.get("scaling_method", "standard"),
+            "handle_missing_values": extra.get("handle_missing_values", True),
+            "handle_outliers": extra.get("handle_outliers", True),
+            "encode_categories": extra.get("encode_categories", True),
+            "create_polynomial_features": extra.get("create_polynomial_features", False),
+            "create_interactions": extra.get("create_interactions", False),
+            "original_columns": extra.get("original_columns", []),
+            "selected_features": extra.get("selected_features", []),
+            "numeric_features": extra.get("numeric_features", []),
+            "categorical_features": extra.get("categorical_features", []),
+            "variance_removed": extra.get("variance_removed", []),
+            "id_columns_detected": extra.get("id_columns_detected", []),
+            "encoding_details": extra.get("encoding_details", {}),
+            "n_rows": _si(extra.get("n_rows", 0)),
+            "original_shape": extra.get("original_shape"),
+            "final_shape": extra.get("final_shape") or extra.get("train_shape"),
+            "execution_time": _sf(extra.get("execution_time_seconds", 0)),
+            "features_before_variance": extra.get("features_before_variance"),
+            "features_after_variance": extra.get("features_after_variance"),
+            "n_selected": extra.get("n_selected"),
+        }
+
+        # ── Log Parsing Enrichment ──
+        # If raw Kedro log is provided, parse it to fill any missing fields
+        pipeline_log = extra.get("pipeline_log")
+        if pipeline_log:
+            try:
+                from app.core.agent.fe_log_parser import FELogParser
+                parser = FELogParser()
+                parsed = parser.parse(pipeline_log)
+                intel = parsed.get("intelligence_request", {})
+
+                # Fill in any fields that weren't in the frontend extra
+                for key in ["original_columns", "selected_features", "numeric_features",
+                            "categorical_features", "variance_removed", "id_columns_detected",
+                            "encoding_details"]:
+                    if not enriched.get(key) and intel.get(key):
+                        enriched[key] = intel[key]
+
+                for key in ["original_shape", "final_shape", "n_rows",
+                            "features_before_variance", "features_after_variance",
+                            "n_selected"]:
+                    if not enriched.get(key) and intel.get(key):
+                        enriched[key] = intel[key]
+
+                # Always add auto-detected issues
+                enriched["_log_issues"] = parsed.get("auto_detected_issues", [])
+                enriched["_log_parsed"] = True
+
+            except Exception as e:
+                enriched["_log_parse_error"] = str(e)
+
+        return enriched
 
     async def _enrich_training(self, ctx, extra):
         enriched = {

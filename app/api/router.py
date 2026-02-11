@@ -3,7 +3,9 @@ API Router — Combines all endpoint groups under /agent.
 
 Original (7 endpoints):     /api/v1/agent/{insights,ask,validate,recommend,feedback,readiness,health}
 Enhanced (16 endpoints):    /api/v1/agent/enhanced/*, /api/v1/agent/feedback/*, /api/v1/agent/cost-matrices/*, etc.
-ML Flow (4 endpoints):      /api/v1/agent/mlflow/{smart-config,compare,explain,head-to-head}
+ML Flow (9 endpoints):      /api/v1/agent/mlflow/{smart-config,compare,explain,head-to-head,...}
+Features (8 endpoints):     /api/v1/agent/features/{deep-analysis,quality-score,smart-config,...}
+FE Intelligence (3 new):    /api/v1/agent/features/{log-intelligence,pipeline-intelligence,quick-health}
 """
 
 from fastapi import APIRouter
@@ -12,6 +14,8 @@ from app.api.v1.agent import router as agent_router
 from app.api.v1.enhanced import router as enhanced_router
 from app.api.v1.eda_endpoints import router as eda_router
 from app.api.v1.mlflow_endpoints import router as mlflow_router
+from app.api.v1.feature_endpoints import router as feature_router
+from app.api.v1.fe_unified_endpoint import router as fe_unified_router
 
 api_router = APIRouter()
 
@@ -37,4 +41,16 @@ api_router.include_router(
     mlflow_router,
     prefix="/agent",
     tags=["ML Expert Agent — ML Flow AI"],
+)
+
+api_router.include_router(
+    feature_router,
+    prefix="/agent",
+    tags=["ML Expert Agent — Feature Engineering AI"],
+)
+
+api_router.include_router(
+    fe_unified_router,
+    prefix="/agent",
+    tags=["ML Expert Agent — FE Log Intelligence"],
 )

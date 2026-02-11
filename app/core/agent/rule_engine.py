@@ -159,6 +159,7 @@ class RuleEngine(_get_extended_mixin()):
             self._rules_dashboard_overview(context, insights)
             for _ext in [
                 '_rules_feature_engineering_extended',
+                '_rules_feature_engineering_expert',
                 '_rules_training_config_extended',
                 '_rules_algorithm_selection_extended',
                 '_rules_evaluation_metrics_extended',
@@ -178,6 +179,8 @@ class RuleEngine(_get_extended_mixin()):
             self._rules_feature_engineering(context, insights)
             if hasattr(self, '_rules_feature_engineering_extended'):
                 self._rules_feature_engineering_extended(context, insights)
+            if hasattr(self, '_rules_feature_engineering_expert'):
+                self._rules_feature_engineering_expert(context, insights)
 
         if screen in ("mlflow", "training"):
             self._rules_training_config(context, insights)
@@ -200,6 +203,13 @@ class RuleEngine(_get_extended_mixin()):
             self._rules_deployment_safety(context, insights)
             if hasattr(self, '_rules_deployment_extended'):
                 self._rules_deployment_extended(context, insights)
+
+        if screen in ("feature_engineering",):
+            self._rules_feature_engineering(context, insights)
+            if hasattr(self, '_rules_feature_engineering_extended'):
+                self._rules_feature_engineering_extended(context, insights)
+            if hasattr(self, '_rules_feature_engineering_expert'):
+                self._rules_feature_engineering_expert(context, insights)
 
         if screen in ("monitoring", "predictions"):
             self._rules_monitoring_drift(context, insights)

@@ -1,0 +1,801 @@
+"""
+Feature Engineering Unified Intelligence Endpoint
+=====================================================
+The ULTIMATE FE intelligence endpoint that accepts raw Kedro pipeline logs
+and produces world-class analysis — combining:
+
+  1. FE Log Parser      → Extracts structured data from raw Kedro stdout
+  2. FeatureAnalyzer     → Deep analysis (transformations, selection, quality)
+  3. FEPipelineIntel     → 16 expert analyzers (type detection, leakage, etc.)
+  4. DB Enrichment       → EDA statistics, model importance, job history
+  5. Expert Rules        → FE-010 to FE-025 domain-specific rules
+
+Endpoints:
+  POST /features/log-intelligence    — THE BIG ONE: Raw logs → Full analysis
+  POST /features/pipeline-intelligence — Structured data → Full analysis (existing)
+  POST /features/quick-health        — Fast health check
+
+Data Flow:
+  Raw Kedro Logs → FELogParser → Structured Data → All Analyzers → Rich JSON
+                                      ↑
+                               DB Enrichment (EDA, Models, Jobs)
+"""
+
+import json
+import logging
+import time
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends
+
+from app.core.database import get_db
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/features", tags=["Feature Intelligence"])
+
+
+# ═══════════════════════════════════════════════════════════════
+# REQUEST MODELS
+# ═══════════════════════════════════════════════════════════════
+
+class LogIntelligenceRequest(BaseModel):
+    """
+    Accept raw Kedro pipeline logs for world-class AI analysis.
+
+    Send the full stdout from the Kedro FE pipeline execution.
+    The parser extracts every decision automatically.
+    """
+    pipeline_log: str = Field(..., description="Raw Kedro pipeline stdout log")
+    dataset_id: Optional[str] = Field(None, description="Dataset ID for EDA enrichment")
+    project_id: Optional[str] = Field(None, description="Project ID for model enrichment")
+    model_id: Optional[str] = Field(None, description="Model ID for feature importance")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "pipeline_log": "[2026-02-11 16:41:14,782: INFO/ForkPoolWorker-1] 📊 UNIVERSAL COLUMN TYPE DETECTION...",
+                "dataset_id": "8750650f-0479-428b-a134-3b681dae7492",
+                "project_id": "some-project-id",
+            }
+        }
+
+
+class PipelineIntelligenceRequest(BaseModel):
+    """
+    Structured FE pipeline data for analysis.
+    (The existing request model — enhanced with encoding_details)
+    """
+    # Config
+    scaling_method: str = "standard"
+    handle_missing_values: bool = True
+    handle_outliers: bool = True
+    encode_categories: bool = True
+    create_polynomial_features: bool = False
+    create_interactions: bool = False
+    variance_threshold: float = 0.01
+    n_features_to_select: Optional[int] = None
+
+    # Results
+    original_columns: List[str] = []
+    selected_features: List[str] = []
+    final_columns: List[str] = []
+    numeric_features: List[str] = []
+    categorical_features: List[str] = []
+    variance_removed: List[str] = []
+    id_columns_detected: List[str] = []
+    original_shape: Optional[List[int]] = None
+    final_shape: Optional[List[int]] = None
+    train_shape: Optional[List[int]] = None
+    test_shape: Optional[List[int]] = None
+    n_rows: Optional[int] = None
+    execution_time_seconds: Optional[float] = None
+    target_column: Optional[str] = None
+
+    # Encoding details (per-column)
+    encoding_details: Dict[str, Any] = {}
+
+    # Variance filter details
+    features_before_variance: Optional[int] = None
+    features_after_variance: Optional[int] = None
+
+    # Feature selection
+    features_input_to_selection: Optional[int] = None
+    n_selected: Optional[int] = None
+
+    # DB references
+    dataset_id: Optional[str] = None
+    project_id: Optional[str] = None
+    model_id: Optional[str] = None
+    job_id: Optional[str] = None
+
+
+class QuickHealthRequest(BaseModel):
+    """Minimal request for fast health check."""
+    pipeline_log: Optional[str] = None
+    original_columns: Optional[List[str]] = None
+    selected_features: Optional[List[str]] = None
+    categorical_features: Optional[List[str]] = None
+    variance_removed: Optional[List[str]] = None
+    encoding_details: Optional[Dict[str, Any]] = None
+    original_shape: Optional[List[int]] = None
+    final_shape: Optional[List[int]] = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# DB ENRICHMENT HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+async def _get_eda_data(db, dataset_id: Optional[str]) -> Dict[str, Any]:
+    """Fetch EDA results from database for enrichment."""
+    if not dataset_id or not db:
+        return {}
+    try:
+        from app.models.models import EdaResult
+        eda = db.query(EdaResult).filter(EdaResult.dataset_id == dataset_id).first()
+        if not eda:
+            return {}
+        result = {}
+        for field in ["summary", "statistics", "quality", "correlations"]:
+            raw = getattr(eda, field, None)
+            if raw:
+                try:
+                    result[field] = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError):
+                    result[field] = {}
+        logger.info(f"[FE-Intel] Loaded EDA: stats={len(result.get('statistics', {}))}, "
+                    f"correlations={'yes' if result.get('correlations') else 'no'}")
+        return result
+    except Exception as e:
+        logger.warning(f"[FE-Intel] EDA load failed: {e}")
+        return {}
+
+
+async def _get_model_versions(db, project_id: Optional[str],
+                              model_id: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch model versions for feature importance data."""
+    if not db or (not project_id and not model_id):
+        return {"versions": []}
+    try:
+        from app.models.models import RegisteredModel, ModelVersion
+        query = db.query(ModelVersion)
+        if model_id:
+            query = query.filter(ModelVersion.model_id == model_id)
+        elif project_id:
+            model_ids = db.query(RegisteredModel.id).filter(
+                RegisteredModel.project_id == project_id
+            ).all()
+            if model_ids:
+                query = query.filter(ModelVersion.model_id.in_([m[0] for m in model_ids]))
+            else:
+                return {"versions": []}
+
+        versions = query.order_by(ModelVersion.created_at.desc()).limit(20).all()
+        version_list = []
+        for v in versions:
+            vd = {
+                "algorithm": getattr(v, "algorithm", None),
+                "accuracy": getattr(v, "accuracy", None),
+                "test_score": getattr(v, "test_score", None),
+                "train_score": getattr(v, "train_score", None),
+                "feature_names": getattr(v, "feature_names", None),
+                "feature_importances": getattr(v, "feature_importances", None),
+            }
+            for field in ["feature_names", "feature_importances"]:
+                raw = vd.get(field)
+                if isinstance(raw, str):
+                    try:
+                        vd[field] = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            version_list.append(vd)
+        return {"versions": version_list}
+    except Exception as e:
+        logger.warning(f"[FE-Intel] Model versions load failed: {e}")
+        return {"versions": []}
+
+
+async def _get_job_history(db, project_id: Optional[str],
+                           job_id: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch pipeline job history."""
+    if not db:
+        return {"jobs": [], "last_fe_job": None}
+    try:
+        from app.models.models import Job
+        query = db.query(Job)
+
+        if job_id:
+            job = query.filter(Job.id == job_id).first()
+            if job:
+                job_data = {
+                    "status": getattr(job, "status", None),
+                    "duration": getattr(job, "duration_seconds", None),
+                    "metrics": None,
+                    "config": None,
+                }
+                for field in ["metrics", "config"]:
+                    raw = getattr(job, field, None)
+                    if isinstance(raw, str):
+                        try:
+                            job_data[field] = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                return {"jobs": [job_data], "last_fe_job": job_data}
+
+        if project_id:
+            query = query.filter(Job.project_id == project_id)
+
+        jobs = query.order_by(Job.created_at.desc()).limit(20).all()
+        fe_jobs = []
+        for job in jobs:
+            pl = (getattr(job, "pipeline_name", None) or "").lower()
+            if "feature" in pl or "phase2" in pl:
+                fe_jobs.append({
+                    "status": getattr(job, "status", None),
+                    "duration": getattr(job, "duration_seconds", None),
+                    "created_at": str(getattr(job, "created_at", "")),
+                })
+
+        return {
+            "jobs": fe_jobs,
+            "last_fe_job": fe_jobs[0] if fe_jobs else None,
+        }
+    except Exception as e:
+        logger.warning(f"[FE-Intel] Job history load failed: {e}")
+        return {"jobs": [], "last_fe_job": None}
+
+
+# ═══════════════════════════════════════════════════════════════
+# CORE ANALYSIS ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def _run_full_analysis(
+        config: Dict[str, Any],
+        results: Dict[str, Any],
+        eda_data: Dict[str, Any],
+        model_versions: Dict[str, Any],
+        auto_issues: Optional[List[Dict]] = None,
+) -> Dict[str, Any]:
+    """
+    Run the full FE intelligence analysis pipeline.
+
+    Combines FeatureAnalyzer + FEPipelineIntelligence + auto-detected issues
+    into a single comprehensive analysis output.
+    """
+    analysis = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "analysis_version": "3.0",
+    }
+
+    # ── 1. FeatureAnalyzer (deep analysis) ──
+    try:
+        from app.core.agent.feature_analyzer import FeatureAnalyzer
+        analyzer = FeatureAnalyzer()
+
+        # Transformation audit
+        analysis["transformation_audit"] = analyzer.analyze_transformations(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+
+        # Selection explanation
+        analysis["selection_explanation"] = analyzer.explain_feature_selection(
+            results=results, eda=eda_data, model_versions=model_versions,
+        )
+
+        # Error patterns
+        analysis["error_patterns"] = analyzer.detect_error_patterns(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+
+        # Quality scorecard
+        analysis["quality_scorecard"] = analyzer.assess_quality(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+
+        # Smart config recommendations
+        analysis["smart_config"] = analyzer.generate_smart_config(
+            results=results, eda=eda_data, model_versions=model_versions,
+            current_config=config,
+        )
+
+        # Next steps
+        analysis["next_steps"] = analyzer.generate_next_steps(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+
+        # Feature interactions
+        analysis["feature_interactions"] = analyzer.analyze_feature_interactions(
+            results=results, eda=eda_data,
+        )
+
+        logger.info("[FE-Intel] FeatureAnalyzer completed all 7 analyses")
+
+    except Exception as e:
+        logger.error(f"[FE-Intel] FeatureAnalyzer error: {e}")
+        analysis["_analyzer_error"] = str(e)
+
+    # ── 2. FEPipelineIntelligence (16 expert analyzers) ──
+    try:
+        from app.core.agent.fe_pipeline_intelligence import FEPipelineIntelligence
+        pi = FEPipelineIntelligence()
+
+        # Full pipeline analysis
+        pipeline_analysis = pi.analyze_pipeline(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+        analysis["pipeline_intelligence"] = pipeline_analysis
+
+        # Pipeline quality score
+        quality = pi.score_pipeline_quality(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+        analysis["pipeline_quality_score"] = quality
+
+        # Optimal config suggestion
+        optimal = pi.generate_optimal_config(
+            config=config, results=results,
+            eda=eda_data, model_versions=model_versions,
+        )
+        analysis["optimal_config"] = optimal
+
+        logger.info("[FE-Intel] FEPipelineIntelligence completed")
+
+    except Exception as e:
+        logger.error(f"[FE-Intel] FEPipelineIntelligence error: {e}")
+        analysis["_pipeline_intel_error"] = str(e)
+
+    # ── 3. Auto-detected issues from log parser ──
+    if auto_issues:
+        analysis["log_detected_issues"] = auto_issues
+        analysis["critical_count"] = sum(
+            1 for i in auto_issues if i.get("severity") == "critical"
+        )
+        analysis["warning_count"] = sum(
+            1 for i in auto_issues if i.get("severity") == "warning"
+        )
+        analysis["info_count"] = sum(
+            1 for i in auto_issues if i.get("severity") == "info"
+        )
+
+    # ── 4. Executive Summary ──
+    analysis["executive_summary"] = _generate_executive_summary(analysis, config, results)
+
+    return analysis
+
+
+def _generate_executive_summary(
+        analysis: Dict, config: Dict, results: Dict
+) -> Dict[str, Any]:
+    """Generate the executive summary combining all analysis results."""
+
+    # Collect all issues across all analyzers
+    all_issues = []
+
+    # From log parser
+    log_issues = analysis.get("log_detected_issues", [])
+    for issue in log_issues:
+        all_issues.append({
+            "source": "log_parser",
+            "severity": issue.get("severity", "info"),
+            "code": issue.get("code", ""),
+            "title": issue.get("title", ""),
+            "fix": issue.get("fix", ""),
+        })
+
+    # From transformation audit
+    audit = analysis.get("transformation_audit", {})
+    for section_name in ["scaling", "encoding", "variance", "missing_values",
+                         "outlier_handling", "id_detection", "feature_selection"]:
+        section = audit.get(section_name, {})
+        if isinstance(section, dict):
+            for finding in section.get("findings", []):
+                if isinstance(finding, dict):
+                    sev = finding.get("severity", "info")
+                    if sev in ("critical", "warning"):
+                        all_issues.append({
+                            "source": "transformation_audit",
+                            "severity": sev,
+                            "title": finding.get("message", finding.get("title", "")),
+                        })
+
+    # From error patterns
+    errors = analysis.get("error_patterns", {})
+    for pattern in errors.get("patterns", []):
+        if isinstance(pattern, dict):
+            all_issues.append({
+                "source": "error_patterns",
+                "severity": pattern.get("severity", "warning"),
+                "title": pattern.get("name", pattern.get("title", "")),
+            })
+
+    # From pipeline intelligence
+    pi = analysis.get("pipeline_intelligence", {})
+    for analyzer_name, analyzer_result in pi.items():
+        if isinstance(analyzer_result, dict):
+            for finding in analyzer_result.get("findings", []):
+                if isinstance(finding, dict):
+                    sev = finding.get("severity", "info")
+                    if sev in ("critical", "warning"):
+                        all_issues.append({
+                            "source": f"pipeline_intel.{analyzer_name}",
+                            "severity": sev,
+                            "title": finding.get("title", finding.get("message", "")),
+                        })
+
+    # Count by severity
+    n_critical = sum(1 for i in all_issues if i["severity"] == "critical")
+    n_warning = sum(1 for i in all_issues if i["severity"] == "warning")
+    n_info = sum(1 for i in all_issues if i["severity"] == "info")
+
+    # Determine overall health
+    if n_critical >= 2:
+        health = "critical"
+        health_icon = "🔴"
+        verdict = "Pipeline has critical issues that will significantly impact model quality"
+    elif n_critical == 1:
+        health = "needs_attention"
+        health_icon = "🟠"
+        verdict = "Pipeline has one critical issue — fix before training"
+    elif n_warning >= 3:
+        health = "fair"
+        health_icon = "🟡"
+        verdict = "Pipeline works but has several warnings worth addressing"
+    elif n_warning >= 1:
+        health = "good"
+        health_icon = "🟢"
+        verdict = "Pipeline is good with minor improvements possible"
+    else:
+        health = "excellent"
+        health_icon = "✅"
+        verdict = "World-class feature engineering pipeline — no issues detected"
+
+    # Quality score
+    quality = analysis.get("quality_scorecard", {})
+    quality_pct = quality.get("percentage", quality.get("pct", 0))
+    quality_grade = quality.get("grade", quality.get("verdict", "?"))
+
+    # Pipeline score
+    pi_quality = analysis.get("pipeline_quality_score", {})
+    pi_pct = pi_quality.get("percentage", pi_quality.get("pct", 0))
+
+    # Shape tracking
+    original_shape = results.get("original_shape", config.get("original_shape"))
+    final_shape = results.get("train_shape", results.get("final_shape"))
+
+    n_original = original_shape[1] if original_shape and len(original_shape) >= 2 else "?"
+    n_final = final_shape[1] if final_shape and len(final_shape) >= 2 else "?"
+
+    return {
+        "health": health,
+        "health_icon": health_icon,
+        "verdict": verdict,
+        "quality_score_pct": quality_pct,
+        "quality_grade": quality_grade,
+        "pipeline_score_pct": pi_pct,
+        "total_issues": len(all_issues),
+        "critical_issues": n_critical,
+        "warnings": n_warning,
+        "info": n_info,
+        "feature_journey": f"{n_original} columns → {n_final} features",
+        "top_issues": all_issues[:5],  # Top 5 most important issues
+        "all_issues": all_issues,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@router.post("/log-intelligence")
+async def feature_log_intelligence(
+        request: LogIntelligenceRequest,
+        db=Depends(get_db),
+):
+    """
+    🧠 THE BIG ONE: Raw Kedro logs → World-class FE intelligence.
+
+    Send your raw Kedro pipeline stdout log and get back:
+      - Every pipeline decision dissected
+      - Every issue a senior ML scientist would catch
+      - Quality scorecard with grade
+      - Smart config recommendations
+      - Prioritized next steps
+      - Feature interaction analysis
+      - Executive summary
+
+    This endpoint replaces the need for the frontend to manually extract
+    pipeline results — the log parser does it ALL automatically.
+    """
+    t0 = time.time()
+
+    # ── 1. Parse the raw log ──
+    try:
+        from app.core.agent.fe_log_parser import FELogParser
+        parser = FELogParser()
+        parsed = parser.parse(request.pipeline_log)
+        intel_request = parsed.get("intelligence_request", {})
+        auto_issues = parsed.get("auto_detected_issues", [])
+
+        logger.info(
+            f"[FE-Intel] Parsed log: {parsed['cleaned_line_count']} lines, "
+            f"{len(auto_issues)} auto-detected issues "
+            f"({sum(1 for i in auto_issues if i['severity'] == 'critical')} critical)"
+        )
+    except Exception as e:
+        logger.error(f"[FE-Intel] Log parsing failed: {e}")
+        return {
+            "error": "log_parsing_failed",
+            "message": str(e),
+            "hint": "Ensure the pipeline_log contains the full Kedro stdout output",
+        }
+
+    # ── 2. Build config and results from parsed data ──
+    config = {
+        "scaling_method": intel_request.get("scaling_method", "standard"),
+        "handle_missing_values": intel_request.get("handle_missing_values", True),
+        "handle_outliers": intel_request.get("handle_outliers", True),
+        "encode_categories": intel_request.get("encode_categories", True),
+        "create_polynomial_features": intel_request.get("create_polynomial_features", False),
+        "create_interactions": intel_request.get("create_interactions", False),
+        "variance_threshold": intel_request.get("variance_threshold", 0.01),
+    }
+
+    results = {
+        "original_columns": intel_request.get("original_columns", []),
+        "selected_features": intel_request.get("selected_features", []),
+        "numeric_features": intel_request.get("numeric_features", []),
+        "categorical_features": intel_request.get("categorical_features", []),
+        "id_columns_detected": intel_request.get("id_columns_detected", []),
+        "variance_removed": intel_request.get("variance_removed", []),
+        "encoding_details": intel_request.get("encoding_details", {}),
+        "original_shape": intel_request.get("original_shape"),
+        "train_shape": intel_request.get("train_shape"),
+        "test_shape": intel_request.get("test_shape"),
+        "n_rows": intel_request.get("n_rows"),
+        "features_before_variance": intel_request.get("features_before_variance"),
+        "features_after_variance": intel_request.get("features_after_variance"),
+        "features_input_to_selection": intel_request.get("features_input_to_selection"),
+        "n_selected": intel_request.get("n_selected"),
+        "execution_time_seconds": intel_request.get("execution_time_seconds"),
+    }
+
+    # ── 3. DB Enrichment ──
+    dataset_id = request.dataset_id or intel_request.get("dataset_id")
+    project_id = request.project_id
+    model_id = request.model_id
+
+    eda_data = await _get_eda_data(db, dataset_id)
+    model_versions = await _get_model_versions(db, project_id, model_id)
+    job_history = await _get_job_history(
+        db, project_id, intel_request.get("job_id")
+    )
+
+    # Enrich results from EDA if available
+    if eda_data:
+        results = _enrich_from_eda(results, eda_data)
+
+    # ── 4. Run full analysis ──
+    analysis = _run_full_analysis(
+        config=config,
+        results=results,
+        eda_data=eda_data,
+        model_versions=model_versions,
+        auto_issues=auto_issues,
+    )
+
+    # ── 5. Build response ──
+    elapsed = time.time() - t0
+
+    return {
+        "status": "success",
+        "analysis_time_seconds": round(elapsed, 3),
+        "data_sources": {
+            "log_parsed": True,
+            "eda_enriched": bool(eda_data),
+            "model_versions_available": bool(model_versions.get("versions")),
+            "job_history_available": bool(job_history.get("jobs")),
+        },
+
+        # The parsed log data (for frontend reference)
+        "parsed_log": {
+            "columns_detected": len(parsed.get("columns", {}).get("all_columns", {})),
+            "encoding_columns": len(parsed.get("encoding", {}).get("columns", {})),
+            "pipeline_stages": len(parsed.get("pipeline_stages", [])),
+            "execution_time": parsed.get("execution", {}).get("execution_time_seconds"),
+            "job_id": parsed.get("execution", {}).get("job_id"),
+        },
+
+        # The full analysis
+        **analysis,
+    }
+
+
+@router.post("/pipeline-intelligence")
+async def feature_pipeline_intelligence(
+        request: PipelineIntelligenceRequest,
+        db=Depends(get_db),
+):
+    """
+    Full FE pipeline intelligence from structured data.
+
+    Use this when the frontend has already extracted the pipeline results
+    into structured fields. For raw log analysis, use /log-intelligence.
+    """
+    t0 = time.time()
+
+    # Build config and results from request
+    config = {
+        "scaling_method": request.scaling_method,
+        "handle_missing_values": request.handle_missing_values,
+        "handle_outliers": request.handle_outliers,
+        "encode_categories": request.encode_categories,
+        "create_polynomial_features": request.create_polynomial_features,
+        "create_interactions": request.create_interactions,
+        "variance_threshold": request.variance_threshold,
+    }
+
+    results = {
+        "original_columns": request.original_columns,
+        "selected_features": request.selected_features or request.final_columns,
+        "numeric_features": request.numeric_features,
+        "categorical_features": request.categorical_features,
+        "id_columns_detected": request.id_columns_detected,
+        "variance_removed": request.variance_removed,
+        "encoding_details": request.encoding_details,
+        "original_shape": request.original_shape,
+        "train_shape": request.train_shape or request.final_shape,
+        "test_shape": request.test_shape,
+        "n_rows": request.n_rows,
+        "features_before_variance": request.features_before_variance,
+        "features_after_variance": request.features_after_variance,
+        "features_input_to_selection": request.features_input_to_selection,
+        "n_selected": request.n_selected,
+        "execution_time_seconds": request.execution_time_seconds,
+    }
+
+    # DB Enrichment
+    eda_data = await _get_eda_data(db, request.dataset_id)
+    model_versions = await _get_model_versions(db, request.project_id, request.model_id)
+
+    if eda_data:
+        results = _enrich_from_eda(results, eda_data)
+
+    # Run full analysis
+    analysis = _run_full_analysis(
+        config=config, results=results,
+        eda_data=eda_data, model_versions=model_versions,
+    )
+
+    elapsed = time.time() - t0
+    return {
+        "status": "success",
+        "analysis_time_seconds": round(elapsed, 3),
+        "data_sources": {
+            "log_parsed": False,
+            "eda_enriched": bool(eda_data),
+            "model_versions_available": bool(model_versions.get("versions")),
+        },
+        **analysis,
+    }
+
+
+@router.post("/quick-health")
+async def feature_quick_health(request: QuickHealthRequest):
+    """
+    Fast health check — returns just the critical issues.
+
+    Accepts either raw logs or minimal structured data.
+    No DB enrichment (for speed). Returns in <100ms.
+    """
+    t0 = time.time()
+
+    issues = []
+
+    # If raw log provided, parse it
+    if request.pipeline_log:
+        try:
+            from app.core.agent.fe_log_parser import FELogParser
+            parser = FELogParser()
+            parsed = parser.parse(request.pipeline_log)
+            issues = parsed.get("auto_detected_issues", [])
+        except Exception as e:
+            return {"error": str(e)}
+    else:
+        # Quick checks from structured data
+        if request.categorical_features and request.encoding_details:
+            from app.core.agent.fe_log_parser import NUMERIC_NAME_SIGNALS
+            for col in request.categorical_features:
+                col_lower = col.lower()
+                if any(p in col_lower for p in NUMERIC_NAME_SIGNALS):
+                    enc = request.encoding_details.get(col, {})
+                    unique = enc.get("unique_values", enc.get("unique_total", 0))
+                    if unique > 50:
+                        issues.append({
+                            "severity": "critical",
+                            "code": "FE-LOG-001",
+                            "title": f"'{col}' is likely NUMERIC but classified as Categorical",
+                        })
+
+        if request.variance_removed:
+            known_binary = {"gender", "partner", "dependents", "phoneservice",
+                            "paperlessbilling", "seniorcitizen"}
+            killed = [
+                f for f in request.variance_removed
+                if f.lower().replace("_scaled", "") in known_binary
+            ]
+            if killed:
+                issues.append({
+                    "severity": "warning",
+                    "code": "FE-LOG-003",
+                    "title": f"Variance filter removed {len(killed)} known predictors",
+                })
+
+    elapsed = time.time() - t0
+
+    n_critical = sum(1 for i in issues if i.get("severity") == "critical")
+    n_warning = sum(1 for i in issues if i.get("severity") == "warning")
+
+    health = "critical" if n_critical > 0 else "warning" if n_warning > 0 else "healthy"
+
+    return {
+        "health": health,
+        "health_icon": "🔴" if health == "critical" else "🟡" if health == "warning" else "✅",
+        "issues_count": len(issues),
+        "critical": n_critical,
+        "warnings": n_warning,
+        "issues": issues,
+        "analysis_time_ms": round(elapsed * 1000, 1),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPER: EDA ENRICHMENT
+# ═══════════════════════════════════════════════════════════════
+
+def _enrich_from_eda(results: Dict, eda_data: Dict) -> Dict:
+    """Enrich results with EDA data (statistics, correlations, etc.)."""
+    stats = eda_data.get("statistics") or {}
+    summary = eda_data.get("summary") or {}
+
+    # Infer numeric/categorical from EDA if not in results
+    if not results.get("numeric_features") and stats:
+        numeric = []
+        categorical = []
+        for col, cs in stats.items():
+            if isinstance(cs, dict):
+                dtype = cs.get("dtype", "").lower()
+                if any(t in dtype for t in ["int", "float", "numeric"]):
+                    numeric.append(col)
+                elif any(t in dtype for t in ["object", "category", "string"]):
+                    categorical.append(col)
+        if numeric:
+            results["numeric_features"] = numeric
+        if categorical and not results.get("categorical_features"):
+            results["categorical_features"] = categorical
+
+    # Infer original_columns from EDA
+    if not results.get("original_columns") and stats:
+        results["original_columns"] = list(stats.keys())
+
+    # Infer n_rows
+    if not results.get("n_rows") and summary:
+        n_rows = summary.get("total_rows") or summary.get("n_rows") or summary.get("row_count")
+        if n_rows:
+            results["n_rows"] = int(n_rows)
+
+    # Add correlations for interaction analysis
+    correlations = eda_data.get("correlations")
+    if correlations:
+        results["_correlations"] = correlations
+
+    # Add column statistics for scaling recommendations
+    if stats:
+        results["_column_stats"] = stats
+
+    return results
