@@ -756,7 +756,7 @@ class RuleEngine(_get_extended_mixin()):
                             minority_class = f"'{minority_name}'"
                         else:
                             # Fallback: check class_distribution keys
-                            cd = target_info.get("class_distribution", {}) if isinstance(target_info, dict) else {}
+                            cd = (target_info.get("class_distribution") or {}) if isinstance(target_info, dict) else {}
                             other_keys = [k for k in cd if str(k) != str(top_value)]
                             if other_keys:
                                 minority_class = f"'{other_keys[0]}'"
