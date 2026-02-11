@@ -283,62 +283,98 @@ def _run_full_analysis(
     }
 
     # ── 1. FeatureAnalyzer (deep analysis) ──
+    # Each method runs independently so one crash doesn't kill the rest.
+    _analyzer_errors = []
     try:
         from app.core.agent.feature_analyzer import FeatureAnalyzer
         analyzer = FeatureAnalyzer()
-
-        # Transformation audit
-        analysis["transformation_audit"] = analyzer.analyze_transformations(
-            feature_config=config, feature_results=results,
-            eda_data=eda_data, model_versions=model_versions,
-        )
-
-        # Selection explanation
-        analysis["selection_explanation"] = analyzer.explain_feature_selection(
-            feature_results=results, eda_data=eda_data, model_versions=model_versions,
-        )
-
-        # Error patterns
-        analysis["error_patterns"] = analyzer.detect_error_patterns(
-            feature_config=config, feature_results=results,
-            eda_data=eda_data, model_versions=model_versions,
-        )
-
-        # Quality scorecard
-        analysis["quality_scorecard"] = analyzer.assess_quality(
-            feature_config=config, feature_results=results,
-            eda_data=eda_data, model_versions=model_versions,
-        )
-
-        # Smart config recommendations
-        analysis["smart_config"] = analyzer.generate_smart_config(
-            feature_results=results, eda_data=eda_data, model_versions=model_versions,
-            current_config=config,
-        )
-
-        # Next steps
-        analysis["next_steps"] = analyzer.generate_next_steps(
-            feature_config=config, feature_results=results,
-            eda_data=eda_data, model_versions=model_versions,
-        )
-
-        # Feature interactions
-        analysis["feature_interactions"] = analyzer.analyze_feature_interactions(
-            feature_results=results, eda_data=eda_data,
-        )
-
-        logger.info("[FE-Intel] FeatureAnalyzer completed all 7 analyses")
-
     except Exception as e:
-        logger.error(f"[FE-Intel] FeatureAnalyzer error: {e}")
-        analysis["_analyzer_error"] = str(e)
+        logger.error(f"[FE-Intel] FeatureAnalyzer import failed: {e}")
+        analyzer = None
+        _analyzer_errors.append(f"import: {e}")
+
+    if analyzer:
+        # 1a. Transformation audit
+        try:
+            analysis["transformation_audit"] = analyzer.analyze_transformations(
+                feature_config=config, feature_results=results,
+                eda_data=eda_data, model_versions=model_versions,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] analyze_transformations failed: {e}")
+            _analyzer_errors.append(f"transformation_audit: {e}")
+
+        # 1b. Selection explanation
+        try:
+            analysis["selection_explanation"] = analyzer.explain_feature_selection(
+                feature_results=results, eda_data=eda_data, model_versions=model_versions,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] explain_feature_selection failed: {e}")
+            _analyzer_errors.append(f"selection_explanation: {e}")
+
+        # 1c. Error patterns
+        try:
+            analysis["error_patterns"] = analyzer.detect_error_patterns(
+                feature_config=config, feature_results=results,
+                eda_data=eda_data, model_versions=model_versions,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] detect_error_patterns failed: {e}")
+            _analyzer_errors.append(f"error_patterns: {e}")
+
+        # 1d. Quality scorecard
+        try:
+            analysis["quality_scorecard"] = analyzer.assess_quality(
+                feature_config=config, feature_results=results,
+                eda_data=eda_data, model_versions=model_versions,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] assess_quality failed: {e}")
+            _analyzer_errors.append(f"quality_scorecard: {e}")
+
+        # 1e. Smart config recommendations
+        try:
+            analysis["smart_config"] = analyzer.generate_smart_config(
+                feature_results=results, eda_data=eda_data, model_versions=model_versions,
+                current_config=config,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] generate_smart_config failed: {e}")
+            _analyzer_errors.append(f"smart_config: {e}")
+
+        # 1f. Next steps
+        try:
+            analysis["next_steps"] = analyzer.generate_next_steps(
+                feature_config=config, feature_results=results,
+                eda_data=eda_data, model_versions=model_versions,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] generate_next_steps failed: {e}")
+            _analyzer_errors.append(f"next_steps: {e}")
+
+        # 1g. Feature interactions
+        try:
+            analysis["feature_interactions"] = analyzer.analyze_feature_interactions(
+                feature_results=results, eda_data=eda_data,
+            )
+        except Exception as e:
+            logger.warning(f"[FE-Intel] analyze_feature_interactions failed: {e}")
+            _analyzer_errors.append(f"feature_interactions: {e}")
+
+        n_ok = 7 - len(_analyzer_errors)
+        if _analyzer_errors:
+            logger.warning(f"[FE-Intel] FeatureAnalyzer: {n_ok}/7 succeeded, {len(_analyzer_errors)} failed")
+            analysis["_analyzer_errors"] = _analyzer_errors
+        else:
+            logger.info("[FE-Intel] FeatureAnalyzer completed all 7 analyses ✅")
 
     # ── 2. FEPipelineIntelligence (16 expert analyzers) ──
     try:
         from app.core.agent.fe_pipeline_intelligence import FEPipelineIntelligence
         pi = FEPipelineIntelligence()
 
-        # Full pipeline analysis
+        # Full pipeline analysis (the main method — runs all 16 analyzers)
         pipeline_analysis = pi.analyze_pipeline(
             config=config, results=results,
             eda_data=eda_data, model_versions=model_versions,
@@ -348,19 +384,25 @@ def _run_full_analysis(
         # Extract findings for downstream methods
         findings = pipeline_analysis.get("findings", [])
 
-        # Pipeline quality score
-        quality = pi.score_pipeline_quality(
-            findings=findings, config=config, results=results,
-            eda=eda_data,
-        )
-        analysis["pipeline_quality_score"] = quality
+        # Pipeline quality score (standalone — may differ from internal score)
+        try:
+            quality = pi.score_pipeline_quality(
+                findings=findings, config=config, results=results,
+                eda=eda_data,
+            )
+            analysis["pipeline_quality_score"] = quality
+        except Exception as e:
+            logger.warning(f"[FE-Intel] score_pipeline_quality failed: {e}")
 
         # Optimal config suggestion
-        optimal = pi.generate_optimal_config(
-            config=config, results=results,
-            eda=eda_data, findings=findings,
-        )
-        analysis["optimal_config"] = optimal
+        try:
+            optimal = pi.generate_optimal_config(
+                config=config, results=results,
+                eda=eda_data, findings=findings,
+            )
+            analysis["optimal_config"] = optimal
+        except Exception as e:
+            logger.warning(f"[FE-Intel] generate_optimal_config failed: {e}")
 
         logger.info("[FE-Intel] FEPipelineIntelligence completed")
 
@@ -473,14 +515,34 @@ def _generate_executive_summary(
         health_icon = "✅"
         verdict = "World-class feature engineering pipeline — no issues detected"
 
-    # Quality score
+    # Quality score — prefer FeatureAnalyzer scorecard, fallback to PipelineIntelligence
     quality = analysis.get("quality_scorecard", {})
-    quality_pct = quality.get("percentage", quality.get("pct", 0))
-    quality_grade = quality.get("grade", quality.get("verdict", "?"))
+    quality_pct = quality.get("percentage", 0)
+    quality_grade = quality.get("grade", "")
 
-    # Pipeline score
+    # Fallback: if FeatureAnalyzer didn't produce a quality score, use PipelineIntelligence
+    pi_data = analysis.get("pipeline_intelligence", {})
+    if not quality_pct and pi_data:
+        # Use the quality_score from analyze_pipeline (which internally runs score_pipeline_quality)
+        quality_pct = pi_data.get("quality_score", 0)
+        quality_grade = quality_grade or pi_data.get("quality_grade", "?")
+        # Also try the breakdown to get a more granular score
+        breakdown = pi_data.get("quality_breakdown", {})
+        if breakdown and not quality_pct:
+            total = sum(v.get("score", 0) for v in breakdown.values() if isinstance(v, dict))
+            max_total = sum(v.get("max_score", 0) for v in breakdown.values() if isinstance(v, dict))
+            quality_pct = round(total / max_total * 100) if max_total > 0 else 0
+
+    if not quality_grade or quality_grade == "?":
+        if quality_pct >= 90: quality_grade = "A"
+        elif quality_pct >= 80: quality_grade = "B+"
+        elif quality_pct >= 70: quality_grade = "B"
+        elif quality_pct >= 60: quality_grade = "C"
+        else: quality_grade = "D"
+
+    # Pipeline score (standalone)
     pi_quality = analysis.get("pipeline_quality_score", {})
-    pi_pct = pi_quality.get("percentage", pi_quality.get("pct", 0))
+    pi_pct = pi_quality.get("percentage", pi_quality.get("pct", quality_pct))
 
     # Shape tracking
     original_shape = results.get("original_shape", config.get("original_shape"))
