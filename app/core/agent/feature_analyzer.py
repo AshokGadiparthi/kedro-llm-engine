@@ -1364,7 +1364,7 @@ class FeatureAnalyzer:
             patterns.append({
                 "type": "scaling_mismatch",
                 "severity": "info",
-                "message": f"Scaling applied but all algorithms are tree-based ({', '.join(set(tree_algos)[:3])}) — "
+                "message": f"Scaling applied but all algorithms are tree-based ({', '.join(list(set(tree_algos))[:3])}) — "
                            f"trees don't benefit from feature scaling",
                 "recommendation": "Scaling doesn't hurt tree-based models but adds unnecessary complexity. "
                                   "If only using trees, you can disable scaling.",
@@ -1374,7 +1374,7 @@ class FeatureAnalyzer:
             patterns.append({
                 "type": "scaling_mismatch",
                 "severity": "warning",
-                "message": f"Distance-based algorithms ({', '.join(set(distance_algos)[:3])}) used without scaling — "
+                "message": f"Distance-based algorithms ({', '.join(list(set(distance_algos))[:3])}) used without scaling — "
                            f"features with larger ranges will dominate distance calculations",
                 "recommendation": "Enable scaling (StandardScaler or MinMaxScaler) for distance-based algorithms",
             })

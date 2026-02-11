@@ -34,6 +34,21 @@ from app.core.database import get_db
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/features", tags=["Feature Intelligence"])
 
+# ── Server-side cache for AI Chat integration ──
+# Stores the last FE analysis per dataset_id so the /ask endpoint
+# can reference it when users chat about their FE results.
+_fe_analysis_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def get_cached_fe_analysis(dataset_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve the last FE analysis for a dataset (used by AI Chat context compiler)."""
+    if dataset_id and dataset_id in _fe_analysis_cache:
+        return _fe_analysis_cache[dataset_id]
+    # Return the most recent analysis if no dataset_id specified
+    if _fe_analysis_cache:
+        return next(iter(reversed(_fe_analysis_cache.values())), None)
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════
 # REQUEST MODELS
@@ -592,7 +607,21 @@ async def feature_log_intelligence(
         auto_issues=auto_issues,
     )
 
-    # ── 5. Build response ──
+    # ── 5. Cache for AI Chat ──
+    cache_key = dataset_id or "latest"
+    _fe_analysis_cache[cache_key] = {
+        "config": config,
+        "results": results,
+        "analysis": analysis,
+        "auto_issues": auto_issues,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    # Keep cache small — max 10 entries
+    if len(_fe_analysis_cache) > 10:
+        oldest = next(iter(_fe_analysis_cache))
+        del _fe_analysis_cache[oldest]
+
+    # ── 6. Build response ──
     elapsed = time.time() - t0
 
     return {

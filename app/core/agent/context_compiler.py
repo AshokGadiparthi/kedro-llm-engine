@@ -968,6 +968,100 @@ class ContextCompiler:
             except Exception as e:
                 enriched["_log_parse_error"] = str(e)
 
+        # ── Cached Analysis Results (for AI Chat) ──
+        # If the user already ran FE analysis, include results in chat context
+        try:
+            from app.api.v1.fe_unified_endpoint import get_cached_fe_analysis
+            dataset_id = ctx.get("dataset_id") or extra.get("dataset_id")
+            cached = get_cached_fe_analysis(dataset_id)
+            if cached:
+                analysis = cached.get("analysis", {})
+
+                # Include the most important analysis summaries for the LLM
+                enriched["_cached_analysis"] = True
+                enriched["_analysis_timestamp"] = cached.get("timestamp")
+
+                # Executive summary
+                exec_summary = analysis.get("executive_summary", {})
+                if exec_summary:
+                    enriched["pipeline_health"] = exec_summary.get("health", "unknown")
+                    enriched["quality_score"] = exec_summary.get("quality_score", 0)
+                    enriched["quality_grade"] = exec_summary.get("grade", "")
+                    enriched["total_critical"] = exec_summary.get("total_critical", 0)
+                    enriched["total_warnings"] = exec_summary.get("total_warnings", 0)
+                    enriched["summary_text"] = exec_summary.get("summary", "")
+
+                # Issues (compact form for LLM context)
+                auto_issues = cached.get("auto_issues", [])
+                if auto_issues:
+                    enriched["detected_issues"] = [
+                        {
+                            "code": i.get("code", ""),
+                            "severity": i.get("severity", "info"),
+                            "title": i.get("title", ""),
+                            "impact": i.get("impact", ""),
+                            "fix": i.get("fix", ""),
+                        }
+                        for i in auto_issues
+                    ]
+
+                # Quality scorecard dimensions
+                scorecard = analysis.get("quality_scorecard", {})
+                if scorecard:
+                    enriched["quality_scorecard_summary"] = {
+                        "total_score": scorecard.get("total_score"),
+                        "max_score": scorecard.get("max_score"),
+                        "grade": scorecard.get("grade"),
+                        "verdict": scorecard.get("verdict"),
+                    }
+                    # Include individual dimensions
+                    dims = scorecard.get("dimensions", [])
+                    if dims:
+                        enriched["quality_dimensions"] = [
+                            {"name": d.get("name"), "score": d.get("score"),
+                             "max": d.get("max_score"), "status": d.get("status")}
+                            for d in dims
+                        ]
+
+                # Transformation audit summary
+                audit = analysis.get("transformation_audit", {})
+                if audit:
+                    enriched["audit_grade"] = audit.get("overall_grade")
+                    enriched["audit_score"] = audit.get("overall_score")
+
+                # Smart config recommendations
+                smart_config = analysis.get("smart_config", {})
+                if smart_config:
+                    enriched["recommended_config"] = smart_config.get("recommended", {})
+
+                # Pipeline intelligence findings
+                pi = analysis.get("pipeline_intelligence", {})
+                if pi:
+                    findings = pi.get("findings", [])
+                    if findings:
+                        enriched["expert_findings"] = [
+                            {"code": f.get("code"), "severity": f.get("severity"),
+                             "title": f.get("title"), "fix": f.get("fix")}
+                            for f in findings[:10]
+                        ]
+
+                # Next steps
+                next_steps = analysis.get("next_steps", {})
+                if next_steps:
+                    steps = next_steps.get("steps", [])
+                    if steps:
+                        enriched["next_steps"] = [
+                            {"priority": s.get("priority"), "action": s.get("action"),
+                             "effort": s.get("effort"), "impact": s.get("impact")}
+                            for s in steps[:5]
+                        ]
+
+                logger.info("[FE-Chat] Injected cached FE analysis into chat context")
+        except ImportError:
+            pass  # FE unified endpoint not available
+        except Exception as e:
+            logger.debug(f"[FE-Chat] Could not load cached analysis: {e}")
+
         return enriched
 
     async def _enrich_training(self, ctx, extra):
