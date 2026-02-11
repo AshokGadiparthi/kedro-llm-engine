@@ -392,39 +392,42 @@ class PatternDetector:
         ratio = rows / cols
 
         if ratio < 2:
-            patterns.append(DetectedPattern(
-                pattern_type="dimensionality",
-                severity="critical",
-                title=f"Curse of Dimensionality: {cols} Features, {rows} Samples (Ratio: {ratio:.1f}:1)",
-                explanation=(
-                    f"With {cols} features and only {rows} samples, the feature-to-sample "
-                    f"ratio is {ratio:.1f}:1. In this regime:\n"
-                    f"• Distance metrics become meaningless (all points equidistant)\n"
-                    f"• Every model will overfit without extreme regularization\n"
-                    f"• Cross-validation estimates are unreliable\n"
-                    f"• Need at minimum 10x samples per feature for stable estimates"
-                ),
-                evidence=[
-                    f"Features: {cols}",
-                    f"Samples: {rows}",
-                    f"Ratio: {ratio:.1f}:1 (need ≥10:1)",
-                    f"Recommended max features: {rows // 10}",
-                ],
-                affected_features=[],
-                confidence=1.0,
-                recommended_action=(
-                    f"Aggressively reduce to ≤{rows // 10} features using: "
-                    f"(1) Variance threshold (drop near-zero variance). "
-                    f"(2) Mutual information scoring. "
-                    f"(3) L1 regularization (Lasso) for automatic selection. "
-                    f"(4) PCA to {min(rows // 15, 20)} components."
-                ),
-                quantitative_detail={
-                    "features": cols, "samples": rows,
-                    "ratio": round(ratio, 2),
-                    "recommended_max_features": rows // 10,
-                },
-            ))
+            # Skip critical PD-DIM when cols > rows — DQ-008 rule already fires
+            # Pattern detector adds value only for marginal cases (ratio 2-10)
+            if rows >= cols:
+                patterns.append(DetectedPattern(
+                    pattern_type="dimensionality",
+                    severity="critical",
+                    title=f"Curse of Dimensionality: {cols} Features, {rows} Samples (Ratio: {ratio:.1f}:1)",
+                    explanation=(
+                        f"With {cols} features and only {rows} samples, the feature-to-sample "
+                        f"ratio is {ratio:.1f}:1. In this regime:\n"
+                        f"• Distance metrics become meaningless (all points equidistant)\n"
+                        f"• Every model will overfit without extreme regularization\n"
+                        f"• Cross-validation estimates are unreliable\n"
+                        f"• Need at minimum 10x samples per feature for stable estimates"
+                    ),
+                    evidence=[
+                        f"Features: {cols}",
+                        f"Samples: {rows}",
+                        f"Ratio: {ratio:.1f}:1 (need ≥10:1)",
+                        f"Recommended max features: {rows // 10}",
+                    ],
+                    affected_features=[],
+                    confidence=1.0,
+                    recommended_action=(
+                        f"Aggressively reduce to ≤{rows // 10} features using: "
+                        f"(1) Variance threshold (drop near-zero variance). "
+                        f"(2) Mutual information scoring. "
+                        f"(3) L1 regularization (Lasso) for automatic selection. "
+                        f"(4) PCA to {min(rows // 15, 20)} components."
+                    ),
+                    quantitative_detail={
+                        "features": cols, "samples": rows,
+                        "ratio": round(ratio, 2),
+                        "recommended_max_features": rows // 10,
+                    },
+                ))
         elif ratio < 10:
             patterns.append(DetectedPattern(
                 pattern_type="dimensionality",
@@ -757,20 +760,9 @@ class PatternDetector:
                 if max_val > upper * 2 or min_val < lower * 2:
                     extreme_outlier_cols.append(col)
 
-        if zero_variance_cols:
-            patterns.append(DetectedPattern(
-                pattern_type="distribution",
-                severity="warning",
-                title=f"{len(zero_variance_cols)} Zero-Variance Feature(s) Detected",
-                explanation=(
-                    f"Features with zero variance: {', '.join(zero_variance_cols[:5])}. "
-                    f"These carry no information and will cause errors in scaling/normalization."
-                ),
-                evidence=[f"{col}: variance = 0" for col in zero_variance_cols[:5]],
-                affected_features=zero_variance_cols,
-                confidence=1.0,
-                recommended_action="Drop all zero-variance features before any modeling.",
-            ))
+        # NOTE: Zero-variance detection removed from patterns — FH-003 rule already
+        # covers this with identical output, causing duplicate cards in the UI.
+        # Pattern detector adds value for distribution issues NOT covered by rules.
 
         if len(extreme_skew_cols) >= 3:
             patterns.append(DetectedPattern(

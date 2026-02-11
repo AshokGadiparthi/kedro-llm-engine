@@ -126,7 +126,8 @@ class ExtendedRulesMixin:
             ))
 
         # DQ-012: Very wide dataset (many features)
-        if cols > 100 and rows < cols * 5:
+        # Skip if cols > rows — DQ-008 already covers this more critically
+        if cols > 100 and rows < cols * 5 and rows >= cols:
             out.append(Insight(
                 severity="warning", category="Data Quality",
                 title=f"Wide Dataset ({cols} features) — Curse of Dimensionality Risk",
@@ -166,7 +167,8 @@ class ExtendedRulesMixin:
             ))
 
         # DQ-014: Small dataset with many features
-        if rows < 1000 and cols > 20:
+        # Skip if cols > rows — DQ-008 already covers this more critically
+        if rows < 1000 and cols > 20 and rows >= cols:
             out.append(Insight(
                 severity="warning", category="Data Quality",
                 title=f"Small Data + Many Features ({rows} × {cols})",
@@ -383,12 +385,18 @@ class ExtendedRulesMixin:
         col_names = profile.get("column_names", [])
         numeric_set = set(profile.get("numeric_columns", []))
         monetary_keywords = ["price", "cost", "revenue", "income", "salary", "amount",
-                             "charge", "fee", "spend", "total", "balance"]
-        # Exclude keywords that commonly appear in categorical column names
+                             "charge", "fee", "spend", "balance", "payment",
+                             "total_cost", "total_charge", "total_amount", "total_price",
+                             "total_revenue", "total_spend", "total_fee"]
+        # Exclude keywords for non-monetary numeric columns
         cat_keywords = ["method", "type", "category", "status", "mode", "plan", "class"]
+        non_monetary_keywords = ["area", "distance", "length", "width", "height",
+                                 "count", "flag", "days", "months", "years", "age",
+                                 "ratio", "rate", "pct", "percent", "score"]
         monetary_cols = [
             c for c in col_names
             if any(k in c.lower() for k in monetary_keywords)
+               and not any(nk in c.lower() for nk in non_monetary_keywords)
                and (
                        c in numeric_set  # Must be numeric dtype
                        or not any(ck in c.lower() for ck in cat_keywords)  # OR not obviously categorical

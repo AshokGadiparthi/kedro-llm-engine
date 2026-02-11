@@ -711,24 +711,34 @@ class RuleEngine(_get_extended_mixin()):
                                 "NEVER accuracy alone. "
                                 "(4) Stratified cross-validation to maintain ratio in each fold."
                             ),
-                            evidence=f"Target '{target}' mean={mean_val:.3f} → {minority_pct:.1f}% minority",
+                            evidence=(
+                                f"Target '{target}': "
+                                f"{'0' if mean_val < 0.5 else '1'}={max(mean_val, 1-mean_val)*100:.1f}%, "
+                                f"{'1' if mean_val < 0.5 else '0'}={min(mean_val, 1-mean_val)*100:.1f}%"
+                            ),
                             metric_key="class_imbalance", metric_value=minority_pct,
                             impact="high", confidence=0.95,
                             tags=["imbalance", "binary_classification"], rule_id="TV-002",
                         ))
                     elif minority_pct < 20:
+                        # For binary numeric (0/1): mean = P(1), so minority = min class
+                        majority_label = "0" if mean_val < 0.5 else "1"
+                        minority_label = "1" if mean_val < 0.5 else "0"
+                        majority_pct = (1 - minority_pct / 100) * 100
                         out.append(Insight(
                             severity="warning", category="Target Variable",
                             title=f"Moderate Class Imbalance ({minority_pct:.1f}% minority)",
                             message=(
-                                f"Minority class is {minority_pct:.1f}% of the data. "
-                                f"Models may bias toward the majority class."
+                                f"Target '{target}' is binary. The minority class ({minority_label}) "
+                                f"represents {minority_pct:.1f}% of {rows:,} samples "
+                                f"({int(rows * minority_pct / 100):,} rows). "
+                                f"Models may bias toward predicting {majority_label}."
                             ),
                             action=(
                                 "Use class_weight='balanced' and evaluate with F1 score. "
                                 "Consider stratified K-fold cross-validation."
                             ),
-                            evidence=f"Target '{target}' minority ratio: {minority_pct:.1f}%",
+                            evidence=f"Target '{target}': {majority_label}={majority_pct:.1f}%, {minority_label}={minority_pct:.1f}%",
                             metric_key="class_imbalance", metric_value=minority_pct,
                             impact="medium", tags=["imbalance"], rule_id="TV-003",
                         ))
@@ -975,7 +985,8 @@ class RuleEngine(_get_extended_mixin()):
             ))
 
         # SS-004: Feature-to-sample ratio
-        if cols > 0 and rows > 0:
+        # Skip when cols > rows — DQ-008 already fires as critical for p > n
+        if cols > 0 and rows > 0 and rows >= cols:
             ratio = rows / cols
             if ratio < 5:
                 out.append(Insight(

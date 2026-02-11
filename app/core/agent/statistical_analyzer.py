@@ -620,7 +620,13 @@ class StatisticalAnalyzer:
         # ── Completeness Score (0-100) ──
         completeness = quality.get("completeness", 100)
         high_missing = quality.get("columns_with_high_missing", [])
-        report.completeness_score = max(0, completeness - len(high_missing) * 5)
+        # Penalty: scale by fraction of columns affected, cap at half the completeness
+        if cols > 0 and high_missing:
+            affected_ratio = len(high_missing) / cols  # e.g. 65/138 = 0.47
+            penalty = min(completeness * 0.5, affected_ratio * 60)  # Cap at half completeness
+        else:
+            penalty = 0
+        report.completeness_score = max(5, completeness - penalty)
         if completeness >= 95:
             report.strengths.append("Excellent data completeness")
         elif completeness < 70:
@@ -652,8 +658,10 @@ class StatisticalAnalyzer:
             elif ratio < 20:
                 feature_score -= 10
         # Penalty for high multicollinearity
+        # Exclude near-perfect (≥0.98) — those are leakage, handled by DL-002
         high_pairs = correlations.get("high_pairs", [])
-        high_corr = [p for p in high_pairs if p.get("abs_correlation", 0) >= 0.8]
+        high_corr = [p for p in high_pairs
+                     if 0.8 <= p.get("abs_correlation", 0) < 0.98]
         if len(high_corr) > 5:
             feature_score -= 15
             report.bottlenecks.append(f"{len(high_corr)} highly correlated feature pairs")
