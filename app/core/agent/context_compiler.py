@@ -497,11 +497,12 @@ class ContextCompiler:
                                 # Try reading from actual CSV for target column only
                                 try:
                                     import pandas as _pd
+                                    import os as _os
                                     Dataset = self._get_dataset_model()
                                     if Dataset:
                                         ds = self.db.query(Dataset).filter(Dataset.id == dataset_id).first()
                                         fp = getattr(ds, "file_path", None) if ds else None
-                                        if fp and _pd.io.common.file_exists(fp):
+                                        if fp and _os.path.isfile(fp):
                                             target_series = _pd.read_csv(fp, usecols=[result["name"]])[result["name"]]
                                             vc_real = target_series.value_counts().to_dict()
                                             result["class_distribution"] = {str(k): int(v) for k, v in vc_real.items()}
@@ -510,7 +511,18 @@ class ContextCompiler:
                                                     result["minority_class"] = str(k)
                                                     break
                                 except Exception:
-                                    pass  # Fall back gracefully
+                                    pass  # Fall back to heuristic
+
+                            # Final fallback: common binary opposites
+                            if not result.get("minority_class"):
+                                _opposites = {
+                                    "no": "Yes", "yes": "No", "0": "1", "1": "0",
+                                    "false": "True", "true": "False",
+                                    "negative": "Positive", "positive": "Negative",
+                                }
+                                opp = _opposites.get(str(top_val).lower().strip())
+                                if opp:
+                                    result["minority_class"] = opp
 
                 ns = stats.get("numeric_statistics", {}).get(result["name"])
                 if ns and isinstance(ns, dict):
