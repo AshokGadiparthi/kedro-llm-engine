@@ -279,7 +279,7 @@ class MLFlowAnalyzer:
                 "roc_auc": _safe_float(r.get("roc_auc")),
                 "training_time": _safe_float(r.get("training_time", r.get("training_time_seconds"))),
                 "category": _algo_category(algo),
-                "generalization": _generalization_label(abs(float(train) - float(test))) if train else "Unknown",
+                "generalization": _generalization_label(abs(float(train) - float(test))) if train else "Not Recorded",
             }
             normalized.append(model)
 
@@ -659,6 +659,11 @@ class MLFlowAnalyzer:
         # Merge DB metrics if available (richer than frontend data)
         if model_version_data:
             mv_metrics = model_version_data.get("metrics", {})
+            if not winner.get("train_score") and mv_metrics.get("train_score"):
+                winner["train_score"] = _safe_float(mv_metrics["train_score"])
+                # Recalculate gap now that we have train_score
+                if winner["train_score"] is not None:
+                    winner["gap"] = abs(winner["train_score"] - winner["test_score"])
             if not winner.get("precision") and mv_metrics.get("precision"):
                 winner["precision"] = _safe_float(mv_metrics["precision"])
             if not winner.get("recall") and mv_metrics.get("recall"):
@@ -694,10 +699,12 @@ class MLFlowAnalyzer:
             if passed:
                 score += 2
         else:
+            # Missing train_score = UNKNOWN, not FAILED
+            # Don't penalize when data isn't available
             checks.append({
-                "id": "overfitting", "name": "Overfit Gap ≤ 5%", "passed": False,
+                "id": "overfitting", "name": "Overfit Gap ≤ 5%", "passed": None,
                 "value": "N/A", "threshold": f"{PROD_MAX_OVERFIT_GAP * 100:.0f}%",
-                "detail": "No train/test gap data — cannot assess generalization",
+                "detail": "Train score not recorded — re-train to assess generalization",
                 "weight": 2,
             })
 
@@ -794,8 +801,9 @@ class MLFlowAnalyzer:
             if passed:
                 score += 1
 
-        # Calculate max possible score
-        max_score = sum(c["weight"] for c in checks)
+        # Calculate max possible score — exclude unknowns (no data to evaluate)
+        evaluated_checks = [c for c in checks if c["passed"] is not None]
+        max_score = sum(c["weight"] for c in evaluated_checks) if evaluated_checks else 1
         pct = (score / max_score * 100) if max_score > 0 else 0
 
         # Determine verdict

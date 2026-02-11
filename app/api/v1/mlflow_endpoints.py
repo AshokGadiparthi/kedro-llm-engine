@@ -330,6 +330,73 @@ async def _get_context_data(db, project_id: str = None, dataset_id: str = None, 
     }
 
 
+def _enrich_model_results_from_db(model_dicts: List[Dict], model_versions: Dict) -> List[Dict]:
+    """
+    Enrich frontend model_results with full metrics from DB model_versions.
+
+    The frontend often sends only {algorithm, accuracy/test_score} when loading
+    from the registered models screen. The DB has the full picture:
+    train_score, precision, recall, f1_score, roc_auc, training_time.
+
+    This function matches by algorithm name and fills in missing metrics.
+    """
+    if not model_versions or not model_versions.get("versions"):
+        logger.info(f"[Enrichment] No model_versions data to enrich from (model_versions={type(model_versions)})")
+        return model_dicts
+
+    # Build a lookup: algorithm_name → best version metrics
+    db_lookup = {}
+    for v in model_versions.get("versions", []):
+        algo = (v.get("algorithm") or "").lower().strip()
+        metrics = v.get("metrics", {})
+        if algo and algo not in db_lookup:
+            db_lookup[algo] = {
+                "train_score": metrics.get("train_score"),
+                "test_score": metrics.get("test_score"),
+                "accuracy": metrics.get("accuracy"),
+                "precision": metrics.get("precision"),
+                "recall": metrics.get("recall"),
+                "f1_score": metrics.get("f1_score"),
+                "roc_auc": metrics.get("roc_auc"),
+                "training_time": v.get("training_time_seconds"),
+            }
+
+    logger.info(f"[Enrichment] DB lookup has {len(db_lookup)} algorithms: {list(db_lookup.keys())}")
+    train_scores = {k: v.get("train_score") for k, v in db_lookup.items()}
+    logger.info(f"[Enrichment] DB train_scores: {train_scores}")
+
+    enriched = []
+    for m in model_dicts:
+        m = dict(m)  # copy
+        algo_key = (m.get("algorithm", "")).lower().strip()
+        db_data = db_lookup.get(algo_key, {})
+
+        if not db_data:
+            logger.info(f"[Enrichment] No DB match for '{algo_key}' (available: {list(db_lookup.keys())})")
+
+        # Fill in any missing metrics from DB
+        enriched_fields = []
+        for field in ["train_score", "test_score", "precision", "recall", "f1_score", "roc_auc", "training_time"]:
+            current = m.get(field)
+            db_val = db_data.get(field)
+            if (current is None or current == 0) and db_val is not None and db_val != 0:
+                m[field] = db_val
+                enriched_fields.append(f"{field}={db_val}")
+
+        if enriched_fields:
+            logger.info(f"[Enrichment] {algo_key} enriched: {', '.join(enriched_fields)}")
+
+        # Also fill accuracy ↔ test_score mapping
+        if (m.get("test_score") is None or m.get("test_score") == 0) and m.get("accuracy"):
+            m["test_score"] = m["accuracy"]
+        if (m.get("accuracy") is None or m.get("accuracy") == 0) and m.get("test_score"):
+            m["accuracy"] = m["test_score"]
+
+        enriched.append(m)
+
+    return enriched
+
+
 # ═══════════════════════════════════════════════════════════════
 # ENDPOINT 1: SMART CONFIG — Pre-training (History-Aware)
 # ═══════════════════════════════════════════════════════════════
@@ -414,6 +481,14 @@ async def compare_models(request: CompareRequest, db=Depends(get_db)):
     try:
         orchestrator = _get_orchestrator(db)
         model_dicts = [m.model_dump() for m in request.model_results]
+
+        # Enrich with full DB metrics if project_id/dataset_id available
+        if request.project_id or request.dataset_id:
+            try:
+                ctx_data = await _get_context_data(db, request.project_id, request.dataset_id)
+                model_dicts = _enrich_model_results_from_db(model_dicts, ctx_data.get("model_versions", {}))
+            except Exception:
+                pass  # Non-critical: proceed with frontend data
 
         t1 = time.time()
         analysis = orchestrator.mlflow_analyzer.analyze_leaderboard(
@@ -523,6 +598,7 @@ async def assess_production_readiness(request: ProductionReadinessRequest, db=De
         # Get DB data if model_id provided
         model_version_data = None
         context_profile = None
+        ctx_data = None
 
         if request.model_id or request.project_id:
             t1 = time.time()
@@ -547,6 +623,10 @@ async def assess_production_readiness(request: ProductionReadinessRequest, db=De
 
         orchestrator = _get_orchestrator(db)
         model_dicts = [m.model_dump() for m in request.model_results]
+
+        # Enrich with full metrics from DB if available
+        if ctx_data and ctx_data.get("model_versions"):
+            model_dicts = _enrich_model_results_from_db(model_dicts, ctx_data["model_versions"])
 
         t1 = time.time()
         readiness = orchestrator.mlflow_analyzer.assess_production_readiness(
@@ -590,6 +670,8 @@ async def get_next_steps(request: NextStepsRequest, db=Depends(get_db)):
         timings["db_context"] = round(time.time() - t1, 3)
 
         model_dicts = [m.model_dump() for m in request.model_results]
+        # Enrich with full metrics from DB
+        model_dicts = _enrich_model_results_from_db(model_dicts, ctx_data["model_versions"])
 
         # Get production readiness first (needed for next steps logic)
         t1 = time.time()
@@ -711,9 +793,21 @@ async def deep_analysis(request: DeepAnalysisRequest, db=Depends(get_db)):
         t1 = time.time()
         ctx_data = await _get_context_data(db, request.project_id, request.dataset_id, request.model_id)
         orchestrator = ctx_data["orchestrator"]
+
+        # Also fetch ALL project versions (not just selected model) for enrichment
+        all_project_versions = ctx_data["model_versions"]
+        if request.model_id:
+            try:
+                cc = orchestrator.context_compiler
+                all_project_versions = await cc._get_model_versions(request.project_id or "", None)
+            except Exception:
+                pass  # Fall back to model-specific versions
+
         timings["db_context"] = round(time.time() - t1, 3)
 
         model_dicts = [m.model_dump() for m in request.model_results]
+        # Enrich with full metrics from DB (train_score, precision, recall, etc.)
+        model_dicts = _enrich_model_results_from_db(model_dicts, all_project_versions)
 
         # Get dataset context
         context_profile = None
