@@ -733,6 +733,67 @@ class RuleEngine(_get_extended_mixin()):
                             impact="medium", tags=["imbalance"], rule_id="TV-003",
                         ))
 
+        # TV-002b: CATEGORICAL binary target imbalance (e.g., Churn = "Yes"/"No")
+        # Many real-world targets are text-based, not 0/1 numeric
+        elif target not in numeric_stats:
+            cat_stats = features.get("categorical_stats", {})
+            if target in cat_stats:
+                cs = cat_stats[target]
+                if isinstance(cs, dict):
+                    unique = cs.get("unique", 0)
+                    top_freq = cs.get("top_freq", 0)
+                    top_value = cs.get("top", "")
+
+                    if unique == 2 and rows > 0 and top_freq > 0:
+                        # Binary categorical: compute imbalance from top_freq
+                        majority_pct = (top_freq / rows) * 100
+                        minority_pct = 100 - majority_pct
+                        minority_class = f"non-'{top_value}'"
+
+                        if minority_pct < 5:
+                            out.append(Insight(
+                                severity="critical", category="Target Variable",
+                                title=f"Severe Class Imbalance ({minority_pct:.1f}% minority)",
+                                message=(
+                                    f"Target '{target}' is binary ({unique} classes). "
+                                    f"The majority class '{top_value}' has {majority_pct:.1f}% of samples. "
+                                    f"At this imbalance, a model predicting all '{top_value}' "
+                                    f"achieves {majority_pct:.1f}% accuracy but catches zero "
+                                    f"{minority_class} cases."
+                                ),
+                                action=(
+                                    "Use these techniques in combination: "
+                                    "(1) SMOTE oversampling (after encoding target to 0/1). "
+                                    "(2) class_weight='balanced' in the algorithm. "
+                                    "(3) Evaluate with F1, Precision-Recall AUC — NEVER accuracy alone. "
+                                    "(4) Stratified cross-validation to maintain ratio in each fold."
+                                ),
+                                evidence=f"Target '{target}': '{top_value}'={majority_pct:.1f}%, {minority_class}={minority_pct:.1f}%",
+                                metric_key="class_imbalance", metric_value=minority_pct,
+                                impact="high", confidence=0.95,
+                                tags=["imbalance", "binary_classification"], rule_id="TV-002",
+                            ))
+                        elif minority_pct < 30:
+                            out.append(Insight(
+                                severity="warning", category="Target Variable",
+                                title=f"Moderate Class Imbalance ({minority_pct:.1f}% minority)",
+                                message=(
+                                    f"Target '{target}' is binary. The minority class ({minority_class}) "
+                                    f"represents {minority_pct:.1f}% of {rows:,} samples ({int(rows * minority_pct / 100):,} rows). "
+                                    f"Models may bias toward predicting '{top_value}'."
+                                ),
+                                action=(
+                                    "Use class_weight='balanced' and evaluate with F1 score. "
+                                    "Consider stratified K-fold cross-validation to maintain "
+                                    "class ratio in every fold. At {:.0f}% minority, SMOTE is "
+                                    "optional but stratified CV is mandatory.".format(minority_pct)
+                                ),
+                                evidence=f"Target '{target}': '{top_value}'={majority_pct:.1f}%, {minority_class}={minority_pct:.1f}%",
+                                metric_key="class_imbalance", metric_value=minority_pct,
+                                impact="medium", confidence=0.9,
+                                tags=["imbalance", "binary_classification"], rule_id="TV-003",
+                            ))
+
     # ══════════════════════════════════════════════════════════════
     # 5. DATA LEAKAGE RULES (DL-001 → DL-010)
     # ══════════════════════════════════════════════════════════════

@@ -54,9 +54,9 @@ class SampleDataResponse(BaseModel):
 
 @router.get("/sample", response_model=SampleDataResponse)
 async def get_sample_data(
-    dataset_id: str = Query(..., description="Dataset ID"),
-    n: int = Query(5, ge=1, le=20, description="Number of sample rows"),
-    db=Depends(get_db),
+        dataset_id: str = Query(..., description="Dataset ID"),
+        n: int = Query(5, ge=1, le=20, description="Number of sample rows"),
+        db=Depends(get_db),
 ):
     """
     Return first N rows of the dataset for preview.
@@ -150,9 +150,9 @@ class DistributionsResponse(BaseModel):
 
 @router.get("/distributions", response_model=DistributionsResponse)
 async def get_distributions(
-    dataset_id: str = Query(..., description="Dataset ID"),
-    max_features: int = Query(20, ge=1, le=50, description="Max features to return"),
-    db=Depends(get_db),
+        dataset_id: str = Query(..., description="Dataset ID"),
+        max_features: int = Query(20, ge=1, le=50, description="Max features to return"),
+        db=Depends(get_db),
 ):
     """
     Return distribution data for each feature.
@@ -286,8 +286,8 @@ class CorrelationMatrixResponse(BaseModel):
 
 @router.get("/correlations", response_model=CorrelationMatrixResponse)
 async def get_correlation_matrix(
-    dataset_id: str = Query(..., description="Dataset ID"),
-    db=Depends(get_db),
+        dataset_id: str = Query(..., description="Dataset ID"),
+        db=Depends(get_db),
 ):
     """Return full correlation matrix for heatmap visualization."""
     try:
@@ -501,9 +501,9 @@ class TargetAnalysisResponse(BaseModel):
 
 @router.get("/target-analysis", response_model=TargetAnalysisResponse)
 async def get_target_analysis(
-    dataset_id: str = Query(..., description="Dataset ID"),
-    target_column: Optional[str] = Query(None, description="Override target column"),
-    db=Depends(get_db),
+        dataset_id: str = Query(..., description="Dataset ID"),
+        target_column: Optional[str] = Query(None, description="Override target column"),
+        db=Depends(get_db),
 ):
     """
     Auto-detect the target column and analyze its distribution.
@@ -529,8 +529,8 @@ async def get_target_analysis(
 
         # Auto-detect target candidates
         target_patterns = ["target", "label", "class", "churn", "fraud", "outcome",
-                          "default", "survived", "y", "is_", "has_", "attrition",
-                          "response", "result", "status", "diagnosis"]
+                           "default", "survived", "y", "is_", "has_", "attrition",
+                           "response", "result", "status", "diagnosis"]
         candidates = []
 
         for col in columns:
