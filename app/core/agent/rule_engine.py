@@ -748,7 +748,20 @@ class RuleEngine(_get_extended_mixin()):
                         # Binary categorical: compute imbalance from top_freq
                         majority_pct = (top_freq / rows) * 100
                         minority_pct = 100 - majority_pct
-                        minority_class = f"non-'{top_value}'"
+
+                        # Get actual minority class name from target_variable if available
+                        target_info = ctx.get("target_variable", {})
+                        minority_name = target_info.get("minority_class") if isinstance(target_info, dict) else None
+                        if minority_name:
+                            minority_class = f"'{minority_name}'"
+                        else:
+                            # Fallback: check class_distribution keys
+                            cd = target_info.get("class_distribution", {}) if isinstance(target_info, dict) else {}
+                            other_keys = [k for k in cd if str(k) != str(top_value)]
+                            if other_keys:
+                                minority_class = f"'{other_keys[0]}'"
+                            else:
+                                minority_class = "minority class"
 
                         if minority_pct < 5:
                             out.append(Insight(

@@ -308,10 +308,15 @@ class ExtendedRulesMixin:
 
         # FE-005: Target encoding for high-cardinality categoricals
         # Exclude columns already flagged as IDs — DL-001 says to drop those
+        # Exclude columns likely numeric stored as text — DQ-010 says to convert those
         id_col_names = {c.get("column", "") for c in features.get("potential_id_columns", [])}
+        numeric_keywords = {"amount", "total", "charge", "price", "cost", "revenue",
+                            "income", "salary", "fee", "score", "rating", "count",
+                            "balance", "spend", "value", "rate", "percentage", "pct"}
         high_card = [
             c for c in features.get("high_cardinality_categoricals", [])
             if c.get("column", "") not in id_col_names
+               and not any(k in c.get("column", "").lower() for k in numeric_keywords)
         ]
         if high_card:
             out.append(Insight(

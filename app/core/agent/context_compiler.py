@@ -468,6 +468,50 @@ class ContextCompiler:
                 if cs and isinstance(cs, dict):
                     u = _si(cs.get("unique", 0))
                     result["type"] = "binary" if u == 2 else "multiclass" if u <= 20 else "high_cardinality"
+
+                    # For binary categorical targets, compute class distribution
+                    if u == 2:
+                        top_val = cs.get("top", "")
+                        top_freq = _si(cs.get("freq", 0))
+                        total = _si(summary.get("shape", [0])[0] if isinstance(summary.get("shape"), list) else 0)
+                        if top_freq > 0 and total > 0:
+                            minority_count = total - top_freq
+                            minority_pct = round(minority_count / total * 100, 1)
+                            result["minority_class_pct"] = minority_pct
+                            result["imbalance_ratio"] = round(minority_count / top_freq, 3) if top_freq > 0 else 0
+                            result["majority_class"] = top_val
+                            result["majority_count"] = top_freq
+                            result["minority_count"] = minority_count
+
+                            # Try to get actual minority class name from value_counts or raw data
+                            vc = cs.get("value_counts") or cs.get("distribution") or cs.get("values")
+                            if isinstance(vc, dict) and len(vc) == 2:
+                                minority_name = [k for k in vc if k != top_val]
+                                if minority_name:
+                                    result["minority_class"] = str(minority_name[0])
+                                    result["class_distribution"] = {
+                                        str(top_val): top_freq,
+                                        str(minority_name[0]): minority_count,
+                                    }
+                            if not result.get("class_distribution"):
+                                # Try reading from actual CSV for target column only
+                                try:
+                                    import pandas as _pd
+                                    Dataset = self._get_dataset_model()
+                                    if Dataset:
+                                        ds = self.db.query(Dataset).filter(Dataset.id == dataset_id).first()
+                                        fp = getattr(ds, "file_path", None) if ds else None
+                                        if fp and _pd.io.common.file_exists(fp):
+                                            target_series = _pd.read_csv(fp, usecols=[result["name"]])[result["name"]]
+                                            vc_real = target_series.value_counts().to_dict()
+                                            result["class_distribution"] = {str(k): int(v) for k, v in vc_real.items()}
+                                            for k in vc_real:
+                                                if str(k) != str(top_val):
+                                                    result["minority_class"] = str(k)
+                                                    break
+                                except Exception:
+                                    pass  # Fall back gracefully
+
                 ns = stats.get("numeric_statistics", {}).get(result["name"])
                 if ns and isinstance(ns, dict):
                     mn = _sf(ns.get("min", -1))
