@@ -148,9 +148,17 @@ class HeadToHeadResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 def _get_orchestrator(db):
-    """Get or create orchestrator instance."""
-    from app.core.agent.orchestrator import Orchestrator
-    return Orchestrator(db)
+    """Get or create orchestrator instance (matches agent.py pattern)."""
+    from app.core.agent.orchestrator import AgentOrchestrator
+    from app.core.agent.memory_store import MemoryStore
+
+    try:
+        from app.models.agent_memory import AgentMemory
+        memory = MemoryStore(db_session=db, memory_model=AgentMemory)
+    except Exception:
+        memory = None
+
+    return AgentOrchestrator(db_session=db, memory_store=memory)
 
 
 # ═══════════════════════════════════════════════════════════════
