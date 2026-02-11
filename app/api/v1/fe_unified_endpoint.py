@@ -274,42 +274,42 @@ def _run_full_analysis(
 
         # Transformation audit
         analysis["transformation_audit"] = analyzer.analyze_transformations(
-            config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            feature_config=config, feature_results=results,
+            eda_data=eda_data, model_versions=model_versions,
         )
 
         # Selection explanation
         analysis["selection_explanation"] = analyzer.explain_feature_selection(
-            results=results, eda=eda_data, model_versions=model_versions,
+            feature_results=results, eda_data=eda_data, model_versions=model_versions,
         )
 
         # Error patterns
         analysis["error_patterns"] = analyzer.detect_error_patterns(
-            config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            feature_config=config, feature_results=results,
+            eda_data=eda_data, model_versions=model_versions,
         )
 
         # Quality scorecard
         analysis["quality_scorecard"] = analyzer.assess_quality(
-            config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            feature_config=config, feature_results=results,
+            eda_data=eda_data, model_versions=model_versions,
         )
 
         # Smart config recommendations
         analysis["smart_config"] = analyzer.generate_smart_config(
-            results=results, eda=eda_data, model_versions=model_versions,
+            feature_results=results, eda_data=eda_data, model_versions=model_versions,
             current_config=config,
         )
 
         # Next steps
         analysis["next_steps"] = analyzer.generate_next_steps(
-            config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            feature_config=config, feature_results=results,
+            eda_data=eda_data, model_versions=model_versions,
         )
 
         # Feature interactions
         analysis["feature_interactions"] = analyzer.analyze_feature_interactions(
-            results=results, eda=eda_data,
+            feature_results=results, eda_data=eda_data,
         )
 
         logger.info("[FE-Intel] FeatureAnalyzer completed all 7 analyses")
@@ -326,21 +326,24 @@ def _run_full_analysis(
         # Full pipeline analysis
         pipeline_analysis = pi.analyze_pipeline(
             config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            eda_data=eda_data, model_versions=model_versions,
         )
         analysis["pipeline_intelligence"] = pipeline_analysis
 
+        # Extract findings for downstream methods
+        findings = pipeline_analysis.get("findings", [])
+
         # Pipeline quality score
         quality = pi.score_pipeline_quality(
-            config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            findings=findings, config=config, results=results,
+            eda=eda_data,
         )
         analysis["pipeline_quality_score"] = quality
 
         # Optimal config suggestion
         optimal = pi.generate_optimal_config(
             config=config, results=results,
-            eda=eda_data, model_versions=model_versions,
+            eda=eda_data, findings=findings,
         )
         analysis["optimal_config"] = optimal
 
