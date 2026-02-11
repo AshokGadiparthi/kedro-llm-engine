@@ -313,22 +313,50 @@ class AgentOrchestrator:
             t0 = time.time()
             if screen in ("mlflow", "training") and extra and (extra.get("training_completed") or extra.get("model_results")):
                 try:
+                    model_results = extra.get("model_results", [])
+                    dataset_profile = context.get("dataset_profile")
+
+                    # Phase 1: Leaderboard analysis
                     mlflow_analysis = self.mlflow_analyzer.analyze_leaderboard(
-                        model_results=extra.get("model_results", []),
-                        context=context.get("dataset_profile"),
+                        model_results=model_results,
+                        context=dataset_profile,
                     )
-                    # Merge ML Flow analysis into recommendations
                     bundle.recommendations["mlflow_analysis"] = mlflow_analysis
-                    # Override suggested questions with post-training specific ones
+
                     if mlflow_analysis.get("suggested_questions"):
                         bundle.suggested_questions = mlflow_analysis["suggested_questions"]
-                    # Add training issues to analysis
+
+                    # Phase 1: Training issues
                     training_issues = self.mlflow_analyzer.detect_training_issues(
-                        model_results=extra.get("model_results", []),
-                        context=context.get("dataset_profile"),
+                        model_results=model_results,
+                        context=dataset_profile,
                     )
                     if training_issues:
                         bundle.recommendations["training_issues"] = training_issues
+
+                    # Phase 2: Production readiness score card
+                    try:
+                        readiness = self.mlflow_analyzer.assess_production_readiness(
+                            model_results=model_results,
+                            context=dataset_profile,
+                        )
+                        bundle.recommendations["production_readiness"] = readiness
+                    except Exception as e:
+                        logger.debug(f"Production readiness failed: {e}")
+
+                    # Phase 2: Next steps (uses registry + history from context)
+                    try:
+                        next_steps = self.mlflow_analyzer.generate_next_steps(
+                            model_results=model_results,
+                            registry_info=context.get("registry_info"),
+                            training_history=context.get("training_history"),
+                            production_readiness=readiness if 'readiness' in dir() else None,
+                            context=dataset_profile,
+                        )
+                        bundle.recommendations["next_steps"] = next_steps
+                    except Exception as e:
+                        logger.debug(f"Next steps failed: {e}")
+
                 except Exception as e:
                     logger.warning(f"ML Flow analysis failed (non-critical): {e}")
             timings["mlflow_analysis"] = round(time.time() - t0, 3)
