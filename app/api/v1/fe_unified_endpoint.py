@@ -137,6 +137,32 @@ class QuickHealthRequest(BaseModel):
     final_shape: Optional[List[int]] = None
 
 
+class SmartIntelligenceRequest(BaseModel):
+    """
+    🧠 SMART-INTELLIGENCE: Works with OR without pipeline logs.
+
+    The system auto-selects the best data source:
+      1. If pipeline_log is provided → parse it (most granular)
+      2. If metadata file exists → use it (100% accurate)
+      3. If dataset_id has EDA → infer from DB (always available)
+
+    The frontend should ALWAYS use this request model.
+    Just send whatever data is available — the system figures out the rest.
+    """
+    pipeline_log: Optional[str] = Field(None, description="Raw Kedro pipeline stdout log (optional)")
+    dataset_id: Optional[str] = Field(None, description="Dataset ID for EDA/DB analysis")
+    project_id: Optional[str] = Field(None, description="Project ID for model enrichment")
+    model_id: Optional[str] = Field(None, description="Model ID for feature importance")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "dataset_id": "8750650f-0479-428b-a134-3b681dae7492",
+                "project_id": "some-project-id",
+            }
+        }
+
+
 # ═══════════════════════════════════════════════════════════════
 # DB ENRICHMENT HELPERS
 # ═══════════════════════════════════════════════════════════════
@@ -893,3 +919,293 @@ def _enrich_from_eda(results: Dict, eda_data: Dict) -> Dict:
         results["_column_stats"] = stats
 
     return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# NEW: AUTO-INTELLIGENCE (DB-only — no logs required)
+# ═══════════════════════════════════════════════════════════════
+
+class AutoIntelligenceRequest(BaseModel):
+    """
+    DB-only intelligence — no pipeline logs needed.
+
+    Just provide the dataset_id and optionally project/model/job IDs.
+    The system assembles everything from:
+      - EDA results (column stats, correlations, quality)
+      - Job history (pipeline config used)
+      - Model versions (selected features, importances)
+
+    Missing fields are intelligently inferred.
+    """
+    dataset_id: str = Field(..., description="Dataset ID (required — links to EDA)")
+    project_id: Optional[str] = Field(None, description="Project ID for model/job lookup")
+    model_id: Optional[str] = Field(None, description="Model ID for feature importance")
+    job_id: Optional[str] = Field(None, description="Specific job ID to analyze")
+
+    # Optional overrides (if the frontend knows these)
+    scaling_method: Optional[str] = Field(None, description="Override: scaling method used")
+    selected_features: Optional[List[str]] = Field(None, description="Override: final feature list")
+    variance_removed: Optional[List[str]] = Field(None, description="Override: features removed by variance filter")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "dataset_id": "8750650f-0479-428b-a134-3b681dae7492",
+                "project_id": "my-project-id",
+            }
+        }
+
+
+@router.post("/auto-intelligence")
+async def feature_auto_intelligence(
+        request: AutoIntelligenceRequest,
+        db=Depends(get_db),
+):
+    """
+    🧠 AUTO-INTELLIGENCE: Full FE analysis from DB data alone — no logs needed.
+
+    This endpoint is the complement to /log-intelligence:
+      - /log-intelligence: Parse raw Kedro logs → analysis (most granular)
+      - /auto-intelligence: DB data → inference → analysis (always available)
+
+    Works by assembling config/results from 3 DB sources:
+      1. EDA Results   → column names, types, statistics, correlations
+      2. Job History   → pipeline parameters (scaling_method, etc.)
+      3. Model Versions → selected features, importances
+
+    Missing data is intelligently inferred:
+      - Encoding details from EDA cardinality + standard pipeline thresholds
+      - Variance-removed from comparing original vs selected features
+      - ID columns from name patterns + cardinality > 80%
+      - Training shapes from EDA shape + standard 80/20 split
+
+    The output format is IDENTICAL to /log-intelligence, so the frontend
+    can use the same rendering code for both paths.
+    """
+    t0 = time.time()
+
+    # ── 1. Assemble from DB ──
+    try:
+        from app.core.agent.fe_data_assembler import FEDataAssembler
+        assembler = FEDataAssembler(db)
+        config, results, eda_data = await assembler.assemble(
+            dataset_id=request.dataset_id,
+            project_id=request.project_id,
+            job_id=request.job_id,
+            model_id=request.model_id,
+        )
+    except Exception as e:
+        logger.error(f"[FE-Auto] DB assembly failed: {e}")
+        return {
+            "error": "db_assembly_failed",
+            "message": str(e),
+            "hint": "Ensure dataset_id exists and has EDA results",
+        }
+
+    # ── 2. Apply frontend overrides ──
+    if request.scaling_method:
+        config["scaling_method"] = request.scaling_method
+    if request.selected_features:
+        results["selected_features"] = request.selected_features
+        results["n_selected"] = len(request.selected_features)
+    if request.variance_removed:
+        results["variance_removed"] = request.variance_removed
+
+    # ── 3. Load model versions for analyzers ──
+    model_versions = await _get_model_versions(
+        db, request.project_id, request.model_id
+    )
+
+    # ── 4. Run full analysis (same analyzers as log path!) ──
+    analysis = _run_full_analysis(
+        config=config,
+        results=results,
+        eda_data=eda_data,
+        model_versions=model_versions,
+        auto_issues=[],  # No log-parsed issues in DB-only mode
+    )
+
+    # ── 5. Cache for AI Chat ──
+    cache_key = request.dataset_id or "latest"
+    _fe_analysis_cache[cache_key] = {
+        "config": config,
+        "results": results,
+        "analysis": analysis,
+        "auto_issues": [],
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if len(_fe_analysis_cache) > 10:
+        oldest = next(iter(_fe_analysis_cache))
+        del _fe_analysis_cache[oldest]
+
+    # ── 6. Build response (same format as /log-intelligence) ──
+    elapsed = time.time() - t0
+
+    return {
+        "status": "success",
+        "analysis_time_seconds": round(elapsed, 3),
+        "data_sources": {
+            "log_parsed": False,  # Key difference: no logs used
+            "db_assembled": True,
+            "eda_enriched": bool(eda_data.get("statistics")),
+            "model_versions_available": bool(model_versions.get("versions")),
+            "fields_inferred": [
+                k for k in ["encoding_details", "variance_removed",
+                            "id_columns_detected", "train_shape"]
+                if results.get(k)
+            ],
+        },
+
+        # No parsed_log section (since there's no log)
+        "assembly_info": {
+            "original_columns": len(results.get("original_columns", [])),
+            "numeric_features": len(results.get("numeric_features", [])),
+            "categorical_features": len(results.get("categorical_features", [])),
+            "selected_features": len(results.get("selected_features", [])),
+            "id_columns_inferred": results.get("id_columns_detected", []),
+            "variance_removed_inferred": results.get("variance_removed", []),
+        },
+
+        # The full analysis (same structure as /log-intelligence)
+        **analysis,
+    }
+
+
+@router.post("/smart-intelligence")
+async def feature_smart_intelligence(
+        request: SmartIntelligenceRequest,
+        db=Depends(get_db),
+):
+    """
+    🧠 SMART-INTELLIGENCE: Auto-selects the best data path available.
+
+    Priority order:
+      1. Raw pipeline logs (most granular — exact decisions from stdout)
+      2. Structured metadata file (saved by Kedro node — 100% accurate)
+      3. DB inference (EDA + Job + Model — always available after EDA runs)
+
+    The frontend can ALWAYS call this endpoint the same way.
+    It will pick the richest data source automatically.
+
+    This is the RECOMMENDED endpoint for the frontend to call.
+    """
+    dataset_id = request.dataset_id
+    project_id = request.project_id
+    model_id = request.model_id
+
+    # ── Path 1: Raw logs provided → use log parser ──
+    has_meaningful_log = (
+            request.pipeline_log
+            and len(request.pipeline_log.strip()) > 200
+            and "PIPELINE" in request.pipeline_log.upper()
+    )
+    if has_meaningful_log:
+        logger.info("[FE-Smart] Using PATH 1: Log parsing")
+        # Forward to log-intelligence with a LogIntelligenceRequest
+        log_request = LogIntelligenceRequest(
+            pipeline_log=request.pipeline_log,
+            dataset_id=dataset_id,
+            project_id=project_id,
+            model_id=model_id,
+        )
+        return await feature_log_intelligence(log_request, db)
+
+    # ── Path 2: Check for structured metadata file ──
+    if dataset_id:
+        try:
+            from app.core.agent.fe_metadata_capture import (
+                load_fe_metadata_for_dataset,
+                load_fe_metadata,
+            )
+            metadata = load_fe_metadata_for_dataset(dataset_id)
+            if not metadata:
+                metadata = load_fe_metadata()  # Try 'latest'
+
+            if metadata and metadata.get("config") and metadata.get("results"):
+                logger.info("[FE-Smart] Using PATH 2: Structured metadata file")
+                return await _run_from_metadata(metadata, dataset_id, project_id, model_id, db)
+        except Exception as e:
+            logger.warning(f"[FE-Smart] Metadata load failed: {e}")
+
+    # ── Path 3: DB inference (always available if dataset_id exists) ──
+    if dataset_id:
+        logger.info("[FE-Smart] Using PATH 3: DB inference")
+        auto_request = AutoIntelligenceRequest(
+            dataset_id=dataset_id,
+            project_id=project_id,
+            model_id=model_id,
+        )
+        return await feature_auto_intelligence(auto_request, db)
+
+    return {
+        "error": "no_data_source",
+        "message": "No data source available for analysis",
+        "hint": "Provide one of: pipeline_log (raw Kedro output), dataset_id (for DB analysis), or ensure fe_metadata_latest.json exists",
+        "available_paths": {
+            "path_1_logs": "POST pipeline_log with raw Kedro stdout",
+            "path_2_metadata": "Run FE pipeline with metadata capture enabled",
+            "path_3_db": "POST dataset_id to use EDA + Job + Model data",
+        },
+    }
+
+
+async def _run_from_metadata(
+        metadata: Dict, dataset_id: str, project_id: str, model_id: str, db
+) -> Dict[str, Any]:
+    """Run analysis from structured metadata file (Path 2)."""
+    t0 = time.time()
+
+    config = metadata["config"]
+    results = metadata["results"]
+
+    # DB enrichment on top of metadata
+    eda_data = await _get_eda_data(db, dataset_id)
+    model_versions = await _get_model_versions(db, project_id, model_id)
+
+    if eda_data:
+        results = _enrich_from_eda(results, eda_data)
+
+    # Run full analysis
+    analysis = _run_full_analysis(
+        config=config,
+        results=results,
+        eda_data=eda_data,
+        model_versions=model_versions,
+        auto_issues=[],
+    )
+
+    # Cache for AI Chat
+    cache_key = dataset_id or "latest"
+    _fe_analysis_cache[cache_key] = {
+        "config": config,
+        "results": results,
+        "analysis": analysis,
+        "auto_issues": [],
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if len(_fe_analysis_cache) > 10:
+        oldest = next(iter(_fe_analysis_cache))
+        del _fe_analysis_cache[oldest]
+
+    elapsed = time.time() - t0
+
+    return {
+        "status": "success",
+        "analysis_time_seconds": round(elapsed, 3),
+        "data_sources": {
+            "log_parsed": False,
+            "metadata_file": True,
+            "db_assembled": False,
+            "eda_enriched": bool(eda_data.get("statistics") if eda_data else False),
+            "model_versions_available": bool(model_versions.get("versions")),
+            "metadata_captured_at": metadata.get("captured_at"),
+        },
+        "assembly_info": {
+            "original_columns": len(results.get("original_columns", [])),
+            "numeric_features": len(results.get("numeric_features", [])),
+            "categorical_features": len(results.get("categorical_features", [])),
+            "selected_features": len(results.get("selected_features", [])),
+            "source": "metadata_file",
+        },
+        **analysis,
+    }

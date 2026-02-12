@@ -32,6 +32,7 @@ Architecture:
   Handles multi-line Kedro log format with timestamp prefixes.
 """
 
+import json
 import re
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -88,6 +89,45 @@ class FELogParser:
     def __init__(self):
         self.warnings: List[str] = []
 
+    def _extract_embedded_metadata(self, raw_log: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract structured metadata JSON from pipeline log.
+
+        If the Kedro node used FEMetadataCapture.print_to_log(), the log
+        contains a JSON block between [FE-METADATA-JSON-START] and
+        [FE-METADATA-JSON-END] markers.
+
+        This gives 100% accurate structured data — no regex needed for
+        the config/results fields. The regex parsing still runs for
+        issue detection and other enrichment.
+
+        Returns:
+            Parsed metadata dict, or None if no embedded metadata found.
+        """
+        start_marker = "[FE-METADATA-JSON-START]"
+        end_marker = "[FE-METADATA-JSON-END]"
+
+        start_idx = raw_log.find(start_marker)
+        end_idx = raw_log.find(end_marker)
+
+        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+            return None
+
+        json_str = raw_log[start_idx + len(start_marker):end_idx].strip()
+
+        try:
+            metadata = json.loads(json_str)
+            logger.info(
+                f"[FE-Parser] ✅ Found embedded metadata JSON "
+                f"({len(json_str)} bytes, "
+                f"cols={len(metadata.get('results', {}).get('original_columns', []))})"
+            )
+            return metadata
+        except json.JSONDecodeError as e:
+            logger.warning(f"[FE-Parser] Embedded metadata JSON is invalid: {e}")
+            self.warnings.append(f"Embedded metadata JSON parse error: {e}")
+            return None
+
     def parse(self, raw_log: str) -> Dict[str, Any]:
         """
         Parse raw Kedro FE pipeline logs into structured intelligence data.
@@ -108,6 +148,12 @@ class FELogParser:
               - issues: Auto-detected issues
               - pipeline_stages: Ordered list of stages executed
         """
+        # ── Check for embedded structured metadata first ──
+        # If the Kedro node used FEMetadataCapture.print_to_log(),
+        # the log contains a JSON block between markers.
+        # This gives 100% accurate data — no regex guessing.
+        embedded_metadata = self._extract_embedded_metadata(raw_log)
+
         # Clean the log (remove timestamps, worker prefixes)
         lines = self._clean_log(raw_log)
 
@@ -155,6 +201,9 @@ class FELogParser:
 
             # ── Parser Warnings ──
             "parser_warnings": list(self.warnings),
+
+            # ── Embedded Structured Metadata (if Kedro node printed it) ──
+            "embedded_metadata": embedded_metadata,
         }
 
         # ── Auto-detect issues from parsed data ──
@@ -1105,6 +1154,8 @@ class FELogParser:
         Convert parsed log data to PipelineIntelligenceRequest-compatible dict.
 
         This bridges the log parser output to the existing FE intelligence API.
+        If embedded metadata is available (from FEMetadataCapture.print_to_log()),
+        it overrides the regex-parsed values for 100% accuracy.
         """
         config = parsed.get("config", {})
         columns = parsed.get("columns", {})
@@ -1142,7 +1193,7 @@ class FELogParser:
         # Feature selection output
         sel_output = selection.get("output_train_shape")
 
-        return {
+        result = {
             # Config
             "scaling_method": config.get("scaling_method", scaling.get("method", "standard")),
             "handle_missing_values": config.get("handle_missing_values", True),
@@ -1190,6 +1241,62 @@ class FELogParser:
             "_auto_detected_issues": parsed.get("auto_detected_issues", []),
             "_parser_version": "2.0",
         }
+
+        # ── Override with embedded metadata if available ──
+        # Embedded metadata from FEMetadataCapture is 100% accurate
+        # (captured at runtime vs regex-parsed from log text)
+        embedded = parsed.get("embedded_metadata")
+        if embedded:
+            em_config = embedded.get("config", {})
+            em_results = embedded.get("results", {})
+
+            # Override config fields
+            for key in ["scaling_method", "handle_missing_values", "handle_outliers",
+                        "encode_categories", "create_polynomial_features",
+                        "create_interactions", "variance_threshold"]:
+                if key in em_config:
+                    result[key] = em_config[key]
+
+            # Override results fields (only if embedded has data)
+            if em_results.get("original_columns"):
+                result["original_columns"] = em_results["original_columns"]
+            if em_results.get("selected_features"):
+                result["selected_features"] = em_results["selected_features"]
+            elif em_results.get("final_columns"):
+                result["selected_features"] = em_results["final_columns"]
+            if em_results.get("numeric_features"):
+                result["numeric_features"] = em_results["numeric_features"]
+            if em_results.get("categorical_features"):
+                result["categorical_features"] = em_results["categorical_features"]
+            if em_results.get("id_columns_detected"):
+                result["id_columns_detected"] = em_results["id_columns_detected"]
+            if em_results.get("variance_removed"):
+                result["variance_removed"] = em_results["variance_removed"]
+            if em_results.get("encoding_details"):
+                result["encoding_details"] = em_results["encoding_details"]
+            if em_results.get("original_shape"):
+                result["original_shape"] = em_results["original_shape"]
+                result["n_rows"] = em_results["original_shape"][0]
+            if em_results.get("train_shape"):
+                result["train_shape"] = em_results["train_shape"]
+            if em_results.get("test_shape"):
+                result["test_shape"] = em_results["test_shape"]
+            if em_results.get("features_before_variance"):
+                result["features_before_variance"] = em_results["features_before_variance"]
+            if em_results.get("features_after_variance"):
+                result["features_after_variance"] = em_results["features_after_variance"]
+            if em_results.get("n_selected"):
+                result["n_selected"] = em_results["n_selected"]
+            if em_results.get("execution_time_seconds"):
+                result["execution_time_seconds"] = em_results["execution_time_seconds"]
+
+            result["_data_source"] = "embedded_metadata+log"
+            result["_metadata_accuracy"] = "100%"
+            logger.info("[FE-Parser] ✅ Overrode regex-parsed data with embedded metadata")
+        else:
+            result["_data_source"] = "log_regex"
+
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
