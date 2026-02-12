@@ -287,6 +287,138 @@ async def _get_job_history(db, project_id: Optional[str],
 
 
 # ═══════════════════════════════════════════════════════════════
+# FE INTELLIGENCE RESULT STORAGE (Gap 2 Fix)
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_fe_intelligence_table(db):
+    """Auto-create fe_intelligence_results table if it doesn't exist."""
+    try:
+        from sqlalchemy import text
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS fe_intelligence_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset_id TEXT NOT NULL,
+                source TEXT DEFAULT 'pipeline',
+                quality_grade TEXT,
+                quality_score REAL,
+                pipeline_grade TEXT,
+                pipeline_score REAL,
+                critical_count INTEGER DEFAULT 0,
+                warning_count INTEGER DEFAULT 0,
+                analysis_json TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        db.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_fe_intel_dataset
+            ON fe_intelligence_results(dataset_id)
+        """))
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[FE-Intel] Table creation skipped: {e}")
+
+
+async def _store_fe_intelligence(
+        db,
+        dataset_id: Optional[str],
+        analysis: Dict[str, Any],
+        source: str = "pipeline",
+        metadata_input: Optional[Dict[str, Any]] = None,
+):
+    """
+    Store FE intelligence analysis result in the database.
+
+    Called after every analysis endpoint completes.
+    Frontend retrieves via GET /intelligence/{dataset_id}.
+    """
+    if not db or not dataset_id:
+        logger.info("[FE-Intel] No db or dataset_id — skipping storage")
+        return
+
+    try:
+        from sqlalchemy import text
+
+        _ensure_fe_intelligence_table(db)
+
+        # Extract summary scores from analysis
+        scorecard = analysis.get("quality_scorecard", {})
+        pi = analysis.get("pipeline_intelligence", {})
+        quality_grade = scorecard.get("verdict", "unknown")
+        quality_score = scorecard.get("percentage", 0)
+        pipeline_grade = pi.get("quality_grade", "N/A")
+        pipeline_score = pi.get("quality_score", 0)
+        critical_count = pi.get("critical_count", 0)
+        warning_count = pi.get("warning_count", 0)
+
+        analysis_str = json.dumps(analysis, default=str)
+        metadata_str = json.dumps(metadata_input, default=str) if metadata_input else None
+
+        # Check if record exists for this dataset_id
+        existing = db.execute(
+            text("SELECT id FROM fe_intelligence_results WHERE dataset_id = :did ORDER BY created_at DESC LIMIT 1"),
+            {"did": dataset_id}
+        ).fetchone()
+
+        if existing:
+            # Update existing record
+            db.execute(text("""
+                UPDATE fe_intelligence_results SET
+                    source = :source,
+                    quality_grade = :qg,
+                    quality_score = :qs,
+                    pipeline_grade = :pg,
+                    pipeline_score = :ps,
+                    critical_count = :cc,
+                    warning_count = :wc,
+                    analysis_json = :aj,
+                    metadata_json = :mj,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+            """), {
+                "source": source, "qg": quality_grade, "qs": quality_score,
+                "pg": pipeline_grade, "ps": pipeline_score,
+                "cc": critical_count, "wc": warning_count,
+                "aj": analysis_str, "mj": metadata_str,
+                "id": existing[0],
+            })
+            logger.info(
+                f"[FE-Intel] ✅ Updated intelligence for dataset {dataset_id} "
+                f"(grade={pipeline_grade}, score={pipeline_score}, criticals={critical_count})"
+            )
+        else:
+            # Insert new record
+            db.execute(text("""
+                INSERT INTO fe_intelligence_results
+                    (dataset_id, source, quality_grade, quality_score,
+                     pipeline_grade, pipeline_score, critical_count, warning_count,
+                     analysis_json, metadata_json)
+                VALUES
+                    (:did, :source, :qg, :qs, :pg, :ps, :cc, :wc, :aj, :mj)
+            """), {
+                "did": dataset_id, "source": source,
+                "qg": quality_grade, "qs": quality_score,
+                "pg": pipeline_grade, "ps": pipeline_score,
+                "cc": critical_count, "wc": warning_count,
+                "aj": analysis_str, "mj": metadata_str,
+            })
+            logger.info(
+                f"[FE-Intel] ✅ Stored NEW intelligence for dataset {dataset_id} "
+                f"(grade={pipeline_grade}, score={pipeline_score})"
+            )
+
+        db.commit()
+
+    except Exception as e:
+        logger.error(f"[FE-Intel] ❌ Failed to store intelligence: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
 # CORE ANALYSIS ENGINE
 # ═══════════════════════════════════════════════════════════════
 
@@ -709,6 +841,15 @@ async def feature_log_intelligence(
         oldest = next(iter(_fe_analysis_cache))
         del _fe_analysis_cache[oldest]
 
+    # ── 5b. Store in DB for frontend retrieval ──
+    await _store_fe_intelligence(
+        db=db,
+        dataset_id=dataset_id,
+        analysis=analysis,
+        source="log",
+        metadata_input={"config": config, "results": results},
+    )
+
     # ── 6. Build response ──
     elapsed = time.time() - t0
 
@@ -830,6 +971,15 @@ async def feature_pipeline_intelligence(
         eda_data=eda_data, model_versions=model_versions,
     )
 
+    # ── Store intelligence result in DB ──
+    await _store_fe_intelligence(
+        db=db,
+        dataset_id=request.dataset_id,
+        analysis=analysis,
+        source="pipeline",
+        metadata_input={"config": config, "results": results},
+    )
+
     elapsed = time.time() - t0
     return {
         "status": "success",
@@ -839,6 +989,7 @@ async def feature_pipeline_intelligence(
             "eda_enriched": bool(eda_data),
             "model_versions_available": bool(model_versions.get("versions")),
         },
+        "stored_in_db": bool(request.dataset_id),
         **analysis,
     }
 
@@ -1076,6 +1227,15 @@ async def feature_auto_intelligence(
         oldest = next(iter(_fe_analysis_cache))
         del _fe_analysis_cache[oldest]
 
+    # ── 5b. Store in DB for frontend retrieval ──
+    await _store_fe_intelligence(
+        db=db,
+        dataset_id=request.dataset_id,
+        analysis=analysis,
+        source="auto_db",
+        metadata_input={"config": config, "results": results},
+    )
+
     # ── 6. Build response (same format as /log-intelligence) ──
     elapsed = time.time() - t0
 
@@ -1247,3 +1407,129 @@ async def _run_from_metadata(
         },
         **analysis,
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# GET STORED INTELLIGENCE (Frontend reads from here)
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/intelligence/{dataset_id}")
+async def get_fe_intelligence(
+        dataset_id: str,
+        db=Depends(get_db),
+):
+    """
+    📖 GET stored FE intelligence analysis for a dataset.
+
+    The frontend calls this to retrieve the analysis that was
+    automatically stored when the pipeline ran.
+
+    Flow:
+      Kedro runs → metadata.send() → POST /pipeline-intelligence
+      → Analysis stored in DB → Frontend GET /intelligence/{dataset_id}
+    """
+    if not db:
+        return {"error": "no_database", "message": "Database not available"}
+
+    try:
+        from sqlalchemy import text
+
+        _ensure_fe_intelligence_table(db)
+
+        row = db.execute(
+            text("""
+                SELECT id, dataset_id, source, quality_grade, quality_score,
+                       pipeline_grade, pipeline_score, critical_count, warning_count,
+                       analysis_json, metadata_json, created_at, updated_at
+                FROM fe_intelligence_results
+                WHERE dataset_id = :did
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """),
+            {"did": dataset_id}
+        ).fetchone()
+
+        if not row:
+            return {
+                "status": "not_found",
+                "message": f"No FE intelligence found for dataset {dataset_id}",
+                "hint": "Run the FE pipeline first, or POST to /pipeline-intelligence or /log-intelligence",
+            }
+
+        # Parse stored JSON
+        analysis = json.loads(row[9]) if row[9] else {}
+        metadata_input = json.loads(row[10]) if row[10] else {}
+
+        return {
+            "status": "success",
+            "dataset_id": row[1],
+            "source": row[2],
+            "summary": {
+                "quality_grade": row[3],
+                "quality_score": row[4],
+                "pipeline_grade": row[5],
+                "pipeline_score": row[6],
+                "critical_count": row[7],
+                "warning_count": row[8],
+            },
+            "stored_at": str(row[11]),
+            "updated_at": str(row[12]),
+            "metadata_input": metadata_input,
+            **analysis,
+        }
+
+    except Exception as e:
+        logger.error(f"[FE-Intel] GET intelligence failed: {e}")
+        return {"error": "retrieval_failed", "message": str(e)}
+
+
+@router.get("/intelligence")
+async def list_fe_intelligence(
+        db=Depends(get_db),
+        limit: int = 20,
+):
+    """
+    📋 List all stored FE intelligence results.
+
+    Returns a summary list (not full analysis) for dashboard display.
+    """
+    if not db:
+        return {"error": "no_database", "results": []}
+
+    try:
+        from sqlalchemy import text
+
+        _ensure_fe_intelligence_table(db)
+
+        rows = db.execute(
+            text("""
+                SELECT dataset_id, source, quality_grade, quality_score,
+                       pipeline_grade, pipeline_score, critical_count, warning_count,
+                       created_at, updated_at
+                FROM fe_intelligence_results
+                ORDER BY updated_at DESC
+                LIMIT :lim
+            """),
+            {"lim": limit}
+        ).fetchall()
+
+        results = []
+        for r in rows:
+            results.append({
+                "dataset_id": r[0],
+                "source": r[1],
+                "quality_grade": r[2],
+                "quality_score": r[3],
+                "pipeline_grade": r[4],
+                "pipeline_score": r[5],
+                "critical_count": r[6],
+                "warning_count": r[7],
+                "created_at": str(r[8]),
+                "updated_at": str(r[9]),
+            })
+
+        return {"status": "success", "count": len(results), "results": results}
+
+    except Exception as e:
+        logger.error(f"[FE-Intel] List intelligence failed: {e}")
+        return {"error": "retrieval_failed", "results": []}
