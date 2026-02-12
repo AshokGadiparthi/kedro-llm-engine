@@ -27,7 +27,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from app.core.database import get_db
 
@@ -738,16 +738,54 @@ async def feature_log_intelligence(
 
 @router.post("/pipeline-intelligence")
 async def feature_pipeline_intelligence(
-        request: PipelineIntelligenceRequest,
+        raw_request: Request,
         db=Depends(get_db),
 ):
     """
     Full FE pipeline intelligence from structured data.
 
-    Use this when the frontend has already extracted the pipeline results
-    into structured fields. For raw log analysis, use /log-intelligence.
+    Accepts BOTH formats:
+      1. Flat:   {"scaling_method": "standard", "original_columns": [...]}
+      2. Nested: {"config": {"scaling_method": ...}, "results": {"original_columns": ...}}
+
+    The nested format is what fe_metadata_capture.py saves to JSON.
+    The flat format is what post_to_api() sends.
     """
     t0 = time.time()
+
+    # Parse raw JSON body
+    body = await raw_request.json()
+
+    # ── Detect & flatten nested metadata format ──
+    if "config" in body and "results" in body:
+        # Nested format from fe_metadata_capture.py / fe_metadata_latest.json
+        nested_config = body.get("config", {})
+        nested_results = body.get("results", {})
+        flat = {**nested_config, **nested_results}
+        # Carry over any top-level fields that aren't config/results
+        for k, v in body.items():
+            if k not in ("config", "results", "metadata_version", "captured_at"):
+                flat[k] = v
+        logger.info(
+            f"[FE-Intel] Received nested metadata format — flattened "
+            f"{len(nested_config)} config + {len(nested_results)} result fields"
+        )
+    else:
+        flat = body
+
+    # Validate through Pydantic model
+    try:
+        request = PipelineIntelligenceRequest(**flat)
+    except Exception as e:
+        logger.warning(f"[FE-Intel] Pydantic validation warning: {e}")
+        request = PipelineIntelligenceRequest()
+        # Manually set what we can
+        for field in PipelineIntelligenceRequest.model_fields:
+            if field in flat:
+                try:
+                    setattr(request, field, flat[field])
+                except Exception:
+                    pass
 
     # Build config and results from request
     config = {
